@@ -1,12 +1,13 @@
-# app.py — B2BProspects.io | Elite Prospecting Portal (OpenStreetMap edition)
+# app.py — B2BProspects.io | Elite Prospecting Portal (search-index edition)
 from __future__ import annotations
 
 import hmac
 import html
 import io
+import random
 import re
 import time
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 import pandas as pd
 import requests
@@ -17,17 +18,6 @@ import streamlit as st
 # ----------------------------------------------------------------------------
 LICENSE_KEY = "B2BPROSPECTS2026"  # test key; override with st.secrets["LICENSE_KEY"] in prod
 CHECKOUT_URL = "https://b2bprospects.io"
-
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OVERPASS_ENDPOINTS = [
-    "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
-    "https://overpass.private.coffee/api/interpreter",
-]
-HTTP_HEADERS = {
-    "User-Agent": "B2BProspects/1.0 (https://b2bprospects.io; lead research tool)",
-    "Accept": "application/json",
-}
 
 st.set_page_config(
     page_title="B2BProspects.io | Elite Prospecting Portal",
@@ -307,301 +297,445 @@ def inject_css(hide_grid_toolbar: bool) -> None:
 
 
 # ----------------------------------------------------------------------------
-# OSM DATA LAYER (OpenStreetMap: Nominatim geocoder + Overpass API, no keys)
+# SEARCH DATA LAYER (DuckDuckGo public search index via requests + regex)
 # ----------------------------------------------------------------------------
-class LocationNotFound(Exception):
-    """Nominatim could not resolve the target location."""
+class SearchBlocked(Exception):
+    """DuckDuckGo throttled or challenged the request (rate limit / bot check)."""
 
 
-class GeocodeError(Exception):
-    """Nominatim was unreachable or returned an unusable response."""
+class SearchUnavailable(Exception):
+    """DuckDuckGo could not be reached or returned unusable pages."""
 
-
-class OverpassError(Exception):
-    """All Overpass endpoints failed, timed out or were rate limited."""
-
-
-# Keyword aliases -> OSM tag filters. Aliases are matched as whole words after light stemming.
-CATEGORY_RULES: list[tuple[tuple[str, ...], list[tuple[str, str]]]] = [
-    (("plumber", "plumbing"), [("craft", "plumber")]),
-    (("electrician", "electrical"), [("craft", "electrician")]),
-    (("roofer", "roofing", "roof"), [("craft", "roofer")]),
-    (("hvac", "heating", "air conditioning", "ac repair"), [("craft", "hvac")]),
-    (("carpenter", "carpentry"), [("craft", "carpenter")]),
-    (("painter", "painting"), [("craft", "painter")]),
-    (("builder", "contractor", "general contractor", "construction"),
-     [("craft", "builder"), ("office", "construction_company")]),
-    (("landscaper", "landscaping", "gardener", "lawn care"), [("craft", "gardener")]),
-    (("locksmith",), [("craft", "locksmith"), ("shop", "locksmith")]),
-    (("photographer", "photography"), [("craft", "photographer"), ("shop", "photo")]),
-    (("dentist", "dental"), [("amenity", "dentist"), ("healthcare", "dentist")]),
-    (("doctor", "physician", "clinic"),
-     [("amenity", "doctors"), ("amenity", "clinic"), ("healthcare", "doctor")]),
-    (("pharmacy", "drugstore"), [("amenity", "pharmacy")]),
-    (("vet", "veterinarian", "veterinary"), [("amenity", "veterinary")]),
-    (("chiropractor",), [("healthcare", "chiropractor")]),
-    (("physiotherapist", "physio", "physical therapy"), [("healthcare", "physiotherapist")]),
-    (("restaurant", "dining"), [("amenity", "restaurant")]),
-    (("cafe", "coffee shop", "coffee"), [("amenity", "cafe")]),
-    (("bar", "pub"), [("amenity", "bar"), ("amenity", "pub")]),
-    (("fast food", "takeaway"), [("amenity", "fast_food")]),
-    (("bakery",), [("shop", "bakery")]),
-    (("hair salon", "hairdresser", "barber", "salon"), [("shop", "hairdresser")]),
-    (("beauty", "spa", "nail"), [("shop", "beauty")]),
-    (("gym", "fitness"), [("leisure", "fitness_centre")]),
-    (("car repair", "auto repair", "mechanic", "garage"), [("shop", "car_repair")]),
-    (("car dealer", "auto dealer", "car dealership"), [("shop", "car")]),
-    (("florist",), [("shop", "florist")]),
-    (("lawyer", "attorney", "law firm"), [("office", "lawyer")]),
-    (("accountant", "accounting", "cpa"), [("office", "accountant")]),
-    (("real estate", "realtor", "estate agent"), [("office", "estate_agent")]),
-    (("insurance",), [("office", "insurance")]),
-    (("hotel", "motel"), [("tourism", "hotel"), ("tourism", "motel")]),
-    (("school",), [("amenity", "school")]),
-    (("daycare", "kindergarten", "childcare"), [("amenity", "kindergarten"), ("amenity", "childcare")]),
-    (("bank",), [("amenity", "bank")]),
-    (("supermarket", "grocery"), [("shop", "supermarket"), ("shop", "convenience")]),
-    (("clothing", "boutique", "fashion"), [("shop", "clothes")]),
-    (("jeweler", "jewelry"), [("shop", "jewelry")]),
-    (("furniture",), [("shop", "furniture")]),
-    (("laundry", "dry cleaner", "dry cleaning"), [("shop", "laundry"), ("shop", "dry_cleaning")]),
-    (("pet shop", "pet store"), [("shop", "pet")]),
-    (("optician", "eyewear"), [("shop", "optician")]),
-    (("travel agency", "travel agent"), [("shop", "travel_agency")]),
-    (("marketing agency", "advertising", "web design", "digital agency"),
-     [("office", "advertising_agency"), ("office", "it")]),
-    (("tailor", "tailoring"), [("craft", "tailor")]),
-    (("printing", "print shop"), [("craft", "printer"), ("shop", "copyshop")]),
-    (("sign maker", "signage"), [("craft", "sign_maker")]),
-    (("mobile shop", "phone repair"), [("shop", "mobile_phone"), ("craft", "electronics_repair")]),
-    (("software", "it service", "it company"), [("office", "it")]),
-]
-
-CATEGORY_KEYS = ("amenity", "shop", "craft", "office", "healthcare", "leisure", "tourism")
 
 SOCIAL_DOMAINS = (
     "facebook.com", "fb.com", "instagram.com", "linktr.ee", "yelp.com", "twitter.com", "x.com",
     "tiktok.com", "linkedin.com", "youtube.com", "wa.me", "business.site", "sites.google.com",
 )
 
+# Business directories: the listing is real, but the business's own website is unknown.
+DIRECTORY_DOMAINS = (
+    "yellowpages.com", "superpages.com", "bbb.org", "mapquest.com", "manta.com", "angi.com",
+    "homeadvisor.com", "thumbtack.com", "nextdoor.com", "tripadvisor.com", "foursquare.com",
+    "chamberofcommerce.com", "porch.com", "houzz.com", "expertise.com", "threebestrated.com",
+    "yell.com", "cylex.us.com", "buildzoom.com", "alignable.com", "birdeye.com", "merchantcircle.com",
+    "local.yahoo.com", "maps.google.com", "google.com", "bing.com", "apple.com", "opentable.com",
+)
+
+# Never businesses: reference, jobs, forums, marketplaces, media.
+NOISE_DOMAINS = (
+    "wikipedia.org", "reddit.com", "quora.com", "pinterest.com", "indeed.com", "glassdoor.com",
+    "ziprecruiter.com", "craigslist.org", "amazon.com", "ebay.com", "walmart.com", "medium.com",
+    "forbes.com", "nytimes.com", "cnn.com", "bbc.com", "gov", "edu", "github.com", "stackoverflow.com",
+    "zillow.com", "realtor.com", "trulia.com", "redfin.com", "wikihow.com", "investopedia.com",
+)
+
+DDG_ENDPOINTS = (
+    "https://html.duckduckgo.com/html/",
+    "https://lite.duckduckgo.com/lite/",
+)
+USER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+)
+MAX_PAGES_PER_QUERY = 4
+REQUEST_TIMEOUT = (6, 15)
+
+COLUMNS = ["Company Name", "Category", "Website", "Phone Number", "Email", "Physical Address", "Map"]
+
+# --- regexes ---------------------------------------------------------------
+_LINK_RE = re.compile(r"<a\b([^>]*)>(.*?)</a>", re.S | re.I)
+_SNIPPET_RE = re.compile(
+    r"""class=["'][^"']*result[_-]{1,2}snippet[^"']*["'][^>]*>(.*?)</(?:a|td|div)>""", re.S | re.I
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+_FORM_RE = re.compile(r"<form\b[^>]*>(.*?)</form>", re.S | re.I)
+_INPUT_RE = re.compile(r"<input\b([^>]*)>", re.I)
+_PHONE_RE = re.compile(
+    r"(?<![\d\-/])(?:\+?1[\s.\-]?)?(?:\(\d{3}\)|\d{3})[\s.\-]?\d{3}[\s.\-]?\d{4}(?![\d\-/])"
+    r"|(?<![\w])\+\d{1,3}[\s\-]?\(?\d{2,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}(?![\d])"
+)
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
+_STREET_WORDS = (
+    r"St|Street|Ave|Avenue|Blvd|Boulevard|Rd|Road|Dr|Drive|Ln|Lane|Hwy|Highway|Way|Ct|Court|"
+    r"Pkwy|Parkway|Pl|Place|Cir|Circle|Trl|Trail|Fwy|Freeway|Sq|Square"
+)
+_ADDRESS_RE = re.compile(
+    rf"\b\d{{1,6}}\s+(?:[NSEW]\.?\s+)?(?:[A-Za-z0-9.'\-]+\s+){{0,4}}?(?:{_STREET_WORDS})\b\.?"
+    r"(?:,?\s*(?:Suite|Ste|Unit|#)\s*[\w\-]+)?"
+    r"(?:,\s*[A-Za-z .'\-]+,?\s*[A-Z]{2}\.?(?:\s+\d{5}(?:-\d{4})?)?)?",
+    re.I,
+)
+_LISTICLE_RE = re.compile(
+    r"\b(top|best)\s+\d+\b|\b\d+\s+(best|top)\b|\bthe\s+best\b|\bnear\s+me\b|\btop[\s\-]rated\b|"
+    r"\blist\s+of\b|\bhow\s+to\b|\bhow\s+much\b|\bcost\s+of\b|\bprices?\b|\bvs\.?\b|\bguide\b|"
+    r"\bfind\s+(a|the)\b|\bhire\s+(a|the)\b|\bdirectory\b|\bcompanies\s+in\b",
+    re.I,
+)
+_TITLE_SEP_RE = re.compile(r"\s+[|\-–—:•·»]\s+|\s*[|•·»]\s*")
+_GENERIC_SEGMENTS = {
+    "home", "homepage", "welcome", "official site", "official website", "contact", "contact us",
+    "about", "about us", "services", "reviews", "photos", "facebook", "instagram", "yelp",
+    "linkedin", "twitter", "youtube", "tiktok", "yellow pages", "mapquest", "bbb", "better business bureau",
+    "angi", "homeadvisor", "thumbtack", "nextdoor", "foursquare", "tripadvisor",
+}
+_SITE_LABELS = (
+    "facebook", "instagram", "yelp", "linkedin", "twitter", "youtube", "tiktok", "yellow pages",
+    "mapquest", "better business bureau", "bbb", "angi", "homeadvisor", "thumbtack", "nextdoor",
+)
+_BLOCK_MARKERS = ("anomaly-modal", "g-recaptcha", "unfortunately, bots use duckduckgo", "anomaly.js")
+
 
 def sanitize_term(text: str) -> str:
-    """Keep only characters that are safe inside an Overpass QL string / regex."""
+    """Lowercase letters/digits/spaces/hyphens only. Used to validate and normalise user input."""
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 \-]", "", text.lower())).strip()
 
 
-def _stem(word: str) -> str:
-    if len(word) > 4 and word.endswith("ies"):
-        return word[:-3] + "y"
-    if len(word) > 4 and word.endswith(("ses", "xes", "ches", "shes")):
-        return word[:-2]
-    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
-        return word[:-1]
-    return word
+def _host_matches(host: str, domains: tuple[str, ...]) -> bool:
+    return any(host == d or host.endswith("." + d) for d in domains)
 
 
-def _stem_phrase(text: str) -> str:
-    return " ".join(_stem(w) for w in sanitize_term(text).split())
+def _norm(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
-def tag_selectors(keyword: str) -> list[str]:
-    """Translate a free-text industry into Overpass tag selectors. Every selector requires a name."""
-    phrase = f" {_stem_phrase(keyword)} "
-    pairs: list[tuple[str, str]] = []
-    for aliases, tags in CATEGORY_RULES:
-        if any(f" {_stem_phrase(a)} " in phrase for a in aliases):
-            for pair in tags:
-                if pair not in pairs:
-                    pairs.append(pair)
-    if pairs:
-        return [f'["{k}"="{v}"]["name"]' for k, v in pairs]
-
-    # Fallback for niches not in the table: match the term against the main OSM category tags.
-    term = _stem_phrase(keyword)
-    if not term:
-        return []
-    value_term = term.replace(" ", "_")
-    return [f'["{k}"~"{value_term}",i]["name"]' for k in CATEGORY_KEYS]
+def _strip_html(fragment: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(_TAG_RE.sub(" ", fragment))).strip()
 
 
-def build_overpass_query(keyword: str, scope: dict, limit: int) -> str:
-    selectors = tag_selectors(keyword)
-    if not selectors:
-        raise ValueError("Empty keyword")
-    if scope["kind"] == "area":
-        header = f"area(id:{int(scope['id'])})->.searchArea;\n"
-        suffix = "(area.searchArea)"
-    else:
-        south, west, north, east = scope["bbox"]
-        header = ""
-        suffix = f"({south:.6f},{west:.6f},{north:.6f},{east:.6f})"
-    body = "\n".join(f"  nwr{sel}{suffix};" for sel in selectors)
-    return f"[out:json][timeout:45];\n{header}(\n{body}\n);\nout center tags {int(limit)};"
-
-
-def geocode_location(location: str) -> dict:
-    """Resolve a place name to an OSM area id and bounding box using free Nominatim."""
-    try:
-        resp = requests.get(
-            NOMINATIM_URL,
-            params={"q": location, "format": "jsonv2", "limit": 5},
-            headers=HTTP_HEADERS,
-            timeout=20,
-        )
-    except requests.exceptions.RequestException as e:
-        raise GeocodeError(str(e)) from e
-    if resp.status_code != 200:
-        raise GeocodeError(f"Nominatim returned HTTP {resp.status_code}")
-    try:
-        results = resp.json()
-    except ValueError as e:
-        raise GeocodeError("Nominatim returned an unreadable response") from e
-    if not results:
-        raise LocationNotFound(location)
-
-    ranked = sorted(results, key=lambda r: {"relation": 0, "way": 1}.get(r.get("osm_type"), 2))
-    best = ranked[0]
-
-    bbox = None
-    raw_bb = best.get("boundingbox")
-    if raw_bb and len(raw_bb) == 4:
-        south, north, west, east = (float(x) for x in raw_bb)
-        bbox = (south, west, north, east)
-
-    area_id = None
-    if best.get("osm_type") == "relation":
-        area_id = 3600000000 + int(best["osm_id"])
-    elif best.get("osm_type") == "way":
-        area_id = 2400000000 + int(best["osm_id"])
-
-    if area_id is None and bbox is None:
-        raise LocationNotFound(location)
-
-    display = ", ".join(p.strip() for p in str(best.get("display_name", location)).split(",")[:2])
-    return {"name": display or location, "area_id": area_id, "bbox": bbox}
-
-
-def run_overpass(query: str) -> list[dict]:
-    """POST the query to public Overpass servers with retry and failover."""
-    errors: list[str] = []
-    for url in OVERPASS_ENDPOINTS:
-        host = urlparse(url).hostname
-        for attempt in range(2):
-            try:
-                resp = requests.post(url, data={"data": query}, headers=HTTP_HEADERS, timeout=(10, 60))
-            except requests.exceptions.Timeout:
-                errors.append(f"{host}: timed out")
-                break
-            except requests.exceptions.RequestException as e:
-                errors.append(f"{host}: {e}")
-                break
-
-            if resp.status_code == 200:
-                try:
-                    payload = resp.json()
-                except ValueError:
-                    errors.append(f"{host}: unreadable data")
-                    break
-                elements = payload.get("elements", [])
-                remark = str(payload.get("remark", ""))
-                if "runtime error" in remark and not elements:
-                    errors.append(f"{host}: query too heavy ({remark[:80]})")
-                    break
-                return elements
-
-            if resp.status_code in (429, 502, 503, 504):
-                errors.append(f"{host}: busy (HTTP {resp.status_code})")
-                time.sleep(2 * (attempt + 1))
-                continue
-
-            errors.append(f"{host}: HTTP {resp.status_code}")
-            break
-    raise OverpassError(" | ".join(errors) or "unknown error")
-
-
-def _first_value(tags: dict, keys: tuple[str, ...]) -> str | None:
-    for key in keys:
-        value = tags.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.split(";")[0].strip()
-    return None
-
-
-def clean_website(raw: str | None) -> str | None:
-    if not raw:
+def _attr(attrs: str, name: str) -> str | None:
+    m = re.search(rf"""\b{name}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", attrs, re.I)
+    if not m:
         return None
-    url = raw.strip()
-    if not url:
-        return None
-    if "://" not in url:
-        url = "https://" + url
-    return url
+    return next(g for g in m.groups() if g is not None)
 
 
-def build_address(tags: dict) -> str | None:
-    full = tags.get("addr:full")
-    if isinstance(full, str) and full.strip():
-        return full.strip()
-    street = " ".join(p.strip() for p in (tags.get("addr:housenumber"), tags.get("addr:street")) if p and p.strip())
-    city = (tags.get("addr:city") or tags.get("addr:suburb") or tags.get("addr:town") or "").strip()
-    region = " ".join(p.strip() for p in (tags.get("addr:state"), tags.get("addr:postcode")) if p and p.strip())
-    parts = [p for p in (street, city, region) if p]
-    return ", ".join(parts) if parts else None
+# --- HTTP ------------------------------------------------------------------
+def _new_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(
+        {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://duckduckgo.com/",
+            "Origin": "https://duckduckgo.com",
+        }
+    )
+    return s
 
 
-def category_label(tags: dict) -> str | None:
-    for key in CATEGORY_KEYS:
-        value = tags.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.replace("_", " ").title()
-    return None
-
-
-def parse_elements(elements: list[dict]) -> pd.DataFrame:
-    rows = []
-    for el in elements:
-        tags = el.get("tags") or {}
-        name = tags.get("name")
-        if not isinstance(name, str) or not name.strip():
+def _ddg_post(session: requests.Session, url: str, data: dict) -> str:
+    """POST to a DuckDuckGo endpoint with short retries. Raises SearchBlocked / SearchUnavailable."""
+    last = "unknown error"
+    blocked = False
+    for attempt in range(3):
+        try:
+            resp = session.post(url, data=data, timeout=REQUEST_TIMEOUT)
+        except requests.exceptions.RequestException as e:
+            last = str(e)
+            time.sleep(0.8 * (attempt + 1))
             continue
-        email = _first_value(tags, ("email", "contact:email"))
-        if email:
-            email = email.replace("mailto:", "").strip().lower()
-        el_type, el_id = el.get("type"), el.get("id")
-        rows.append(
-            {
-                "Company Name": name.strip(),
-                "Category": category_label(tags),
-                "Website": clean_website(_first_value(tags, ("website", "contact:website", "url", "contact:url"))),
-                "Phone Number": _first_value(tags, ("phone", "contact:phone", "mobile", "contact:mobile")),
-                "Email": email or None,
-                "Physical Address": build_address(tags),
-                "Map": f"https://www.openstreetmap.org/{el_type}/{el_id}" if el_type and el_id else None,
-            }
-        )
-    columns = ["Company Name", "Category", "Website", "Phone Number", "Email", "Physical Address", "Map"]
-    if not rows:
-        return pd.DataFrame(columns=columns)
-    df = pd.DataFrame(rows, columns=columns)
-    return df.sort_values("Company Name", key=lambda s: s.str.lower()).reset_index(drop=True)
+
+        body = resp.text or ""
+        if resp.status_code in (202, 403, 418, 429) or any(m in body.lower() for m in _BLOCK_MARKERS):
+            blocked = True
+            last = f"HTTP {resp.status_code}"
+            time.sleep(1.5 * (attempt + 1) + random.random())
+            continue
+        if resp.status_code >= 500:
+            last = f"HTTP {resp.status_code}"
+            time.sleep(1.0 * (attempt + 1))
+            continue
+        if resp.status_code != 200:
+            raise SearchUnavailable(f"HTTP {resp.status_code}")
+        return body
+    if blocked:
+        raise SearchBlocked(last)
+    raise SearchUnavailable(last)
+
+
+# --- result-page parsing -----------------------------------------------------
+def _unwrap_ddg_href(href: str) -> str | None:
+    href = html.unescape(href).strip()
+    if href.startswith("//"):
+        href = "https:" + href
+    parsed = urlparse(href)
+    host = (parsed.hostname or "").lower()
+    if host.endswith("duckduckgo.com"):
+        if parsed.path.startswith("/l/"):  # organic result redirect; ads use /y.js and are skipped
+            target = parse_qs(parsed.query).get("uddg", [""])[0]
+            return target if target.startswith("http") else None
+        return None
+    return href if href.startswith("http") else None
+
+
+def parse_results(page_html: str) -> list[dict]:
+    """Extract organic results (title, url, snippet) from the HTML or Lite results page."""
+    hits: list[tuple[int, int, str, str]] = []
+    for m in _LINK_RE.finditer(page_html):
+        attrs = m.group(1)
+        cls = _attr(attrs, "class") or ""
+        if "result__a" not in cls and "result-link" not in cls:
+            continue
+        href = _attr(attrs, "href")
+        if not href:
+            continue
+        url = _unwrap_ddg_href(href)
+        hits.append((m.start(), m.end(), url or "", _strip_html(m.group(2))))
+
+    results = []
+    for i, (_, end, url, title) in enumerate(hits):
+        if not url or not title:
+            continue
+        region_end = hits[i + 1][0] if i + 1 < len(hits) else len(page_html)
+        sm = _SNIPPET_RE.search(page_html, end, region_end)
+        results.append({"url": url, "title": title, "snippet": _strip_html(sm.group(1)) if sm else ""})
+    return results
+
+
+def next_page_data(page_html: str) -> dict | None:
+    """Return the form fields that request the next results page, or None on the last page."""
+    best: dict | None = None
+    best_s = -1
+    for fm in _FORM_RE.finditer(page_html):
+        fields = {}
+        for im in _INPUT_RE.finditer(fm.group(1)):
+            name, value = _attr(im.group(1), "name"), _attr(im.group(1), "value")
+            if name:
+                fields[name] = html.unescape(value or "")
+        if "s" in fields and "q" in fields and fields["s"].isdigit() and int(fields["s"]) > best_s:
+            best, best_s = fields, int(fields["s"])
+    return best if best_s > 0 else None
+
+
+# --- lead extraction ---------------------------------------------------------
+def website_root(url: str) -> str:
+    p = urlparse(url)
+    return f"{p.scheme or 'https'}://{(p.hostname or '').lower()}"
+
+
+def _is_business_page(url: str, host: str) -> bool:
+    """For social/directory hosts keep single-business pages, drop posts, groups and search pages."""
+    path = urlparse(url).path.lower().strip("/")
+    segs = [s for s in path.split("/") if s]
+    if host.endswith("yelp.com"):
+        return path.startswith("biz/")
+    if host.endswith("yellowpages.com"):
+        return "/mip/" in f"/{path}/"
+    if host.endswith("bbb.org"):
+        return "/profile/" in f"/{path}/"
+    if host.endswith("facebook.com") or host.endswith("fb.com"):
+        if not segs:
+            return False
+        bad = {"groups", "events", "watch", "marketplace", "public", "hashtag", "posts", "photo", "photos", "reel", "share", "story.php", "login", "help"}
+        if segs[0] in bad or "posts" in segs or "videos" in segs or "photos" in segs:
+            return False
+        return True
+    if host.endswith("instagram.com"):
+        return len(segs) == 1 and segs[0] not in {"explore", "p", "reel", "reels", "tv", "stories"}
+    if host.endswith("linkedin.com"):
+        return bool(segs) and segs[0] == "company"
+    if _host_matches(host, ("twitter.com", "x.com", "tiktok.com", "youtube.com", "linktr.ee", "wa.me")):
+        return len(segs) == 1
+    return True  # business.site, sites.google.com and generic directories: rely on the title filter
+
+
+def clean_business_name(title: str, host: str, location: str) -> str | None:
+    title = re.sub(r"\(@[^)]*\)", " ", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    loc_norm = _norm(location)
+    segments: list[str] = []
+    for seg in _TITLE_SEP_RE.split(title):
+        seg = seg.strip(" ,.-–—|")
+        low = seg.lower()
+        if not seg or low in _GENERIC_SEGMENTS or any(low == lbl or low.startswith(lbl + " ") and len(low) < 22 for lbl in _SITE_LABELS):
+            continue
+        seg_norm = _norm(seg)
+        if loc_norm and seg_norm and len(seg_norm) <= len(loc_norm) + 8 and (loc_norm in seg_norm or seg_norm in loc_norm):
+            continue  # a bare "Houston, TX" style segment
+        if re.fullmatch(r"[A-Za-z .'\-]+,\s*[A-Z]{2}(\s+\d{5})?", seg):
+            continue
+        segments.append(seg)
+    if not segments:
+        return None
+
+    core = _norm(host.split(".")[0]) if host else ""
+    if core and not _host_matches(host, SOCIAL_DOMAINS + DIRECTORY_DOMAINS):
+        for seg in segments:
+            sn = _norm(seg)
+            if len(sn) >= 4 and (sn in core or core in sn):
+                return seg[:80]
+    return segments[0][:80]
+
+
+def _first_phone(text: str) -> str | None:
+    for m in _PHONE_RE.finditer(text):
+        raw = m.group(0).strip()
+        digits = re.sub(r"\D", "", raw)
+        if 10 <= len(digits) <= 13 and not re.fullmatch(r"(19|20)\d{2}\D?(19|20)\d{2}", raw):
+            return raw
+    return None
+
+
+def _first_address(text: str) -> str | None:
+    m = _ADDRESS_RE.search(text)
+    return re.sub(r"\s+", " ", m.group(0)).strip(" ,") if m else None
+
+
+def _first_email(text: str) -> str | None:
+    for m in _EMAIL_RE.finditer(text):
+        email = m.group(0).lower()
+        if not email.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg")):
+            return email
+    return None
+
+
+def maps_link(name: str, location: str) -> str:
+    return "https://www.google.com/maps/search/?api=1&query=" + quote_plus(f"{name} {location}")
+
+
+def result_to_lead(r: dict, keyword: str, location: str) -> dict | None:
+    url, title, snippet = r["url"], r["title"], r["snippet"]
+    host = website_host(url)
+    if not host or _host_matches(host, NOISE_DOMAINS):
+        return None
+    if _LISTICLE_RE.search(title):
+        return None
+
+    is_social = is_social_host(url)
+    is_directory = _host_matches(host, DIRECTORY_DOMAINS)
+    if (is_social or is_directory) and not _is_business_page(url, host):
+        return None
+
+    name = clean_business_name(title, host, location)
+    if not name or len(_norm(name)) < 2:
+        return None
+
+    text = f"{title}. {snippet}"
+    if is_social:
+        website, kind = url.split("#")[0], "social"
+    elif is_directory:
+        website, kind = None, "directory"
+    else:
+        website, kind = website_root(url), "own"
+
+    return {
+        "_kind": kind,
+        "_host": host,
+        "Company Name": name,
+        "Category": keyword.strip().title() or None,
+        "Website": website,
+        "Phone Number": _first_phone(text),
+        "Email": _first_email(text),
+        "Physical Address": _first_address(snippet),
+        "Map": maps_link(name, location),
+    }
+
+
+def merge_leads(leads: list[dict]) -> list[dict]:
+    """De-duplicate: one row per business. A real own-website beats a social/directory listing."""
+    by_key: dict[str, dict] = {}
+    order: list[str] = []
+    for lead in leads:
+        key = f"host:{lead['_host']}" if lead["_kind"] == "own" else f"name:{_norm(lead['Company Name'])}"
+        name_key = f"name:{_norm(lead['Company Name'])}"
+        existing = by_key.get(key) or by_key.get(name_key)
+        if existing is None:
+            by_key[key] = lead
+            by_key.setdefault(name_key, lead)
+            order.append(key)
+            continue
+        # merge into existing row
+        if lead["_kind"] == "own" and existing["_kind"] != "own":
+            for col in ("Phone Number", "Email", "Physical Address"):
+                lead[col] = lead[col] or existing[col]
+            existing.clear()
+            existing.update(lead)
+            by_key[key] = existing
+        else:
+            for col in ("Phone Number", "Email", "Physical Address"):
+                existing[col] = existing[col] or lead[col]
+            if existing["Website"] is None and lead["Website"]:
+                existing["Website"], existing["_kind"] = lead["Website"], lead["_kind"]
+    seen, out = set(), []
+    for key in order:
+        lead = by_key[key]
+        if id(lead) not in seen:
+            seen.add(id(lead))
+            out.append(lead)
+    return out
+
+
+def leads_to_frame(leads: list[dict]) -> pd.DataFrame:
+    if not leads:
+        return pd.DataFrame(columns=COLUMNS)
+    df = pd.DataFrame([{c: lead.get(c) for c in COLUMNS} for lead in leads], columns=COLUMNS)
+    return df.astype(object).where(df.notna(), None).reset_index(drop=True)
+
+
+def _search_queries(keyword: str, location: str) -> list[str]:
+    return [
+        f"{keyword} in {location}",
+        f"{keyword} {location} phone address",
+        f"{keyword} {location} facebook",
+    ]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_leads(keyword: str, location: str, max_results: int) -> tuple[pd.DataFrame, str]:
-    geo = geocode_location(location)
+    session = _new_session()
+    collected: list[dict] = []
+    raw_seen: set[str] = set()
+    errors: list[Exception] = []
+    ok_requests = 0
 
-    scopes = []
-    if geo["area_id"]:
-        scopes.append({"kind": "area", "id": geo["area_id"]})
-    if geo["bbox"]:
-        scopes.append({"kind": "bbox", "bbox": geo["bbox"]})
-
-    elements: list[dict] = []
-    for scope in scopes:
-        elements = run_overpass(build_overpass_query(keyword, scope, max_results))
-        if elements:
+    for qi, query in enumerate(_search_queries(keyword, location)):
+        if len(merge_leads([dict(x) for x in collected])) >= max_results:
             break
-    return parse_elements(elements), geo["name"]
+        form: dict | None = {"q": query, "b": "", "kl": "us-en"}
+        endpoint_ok = False
+        for endpoint in DDG_ENDPOINTS:
+            try:
+                page = _ddg_post(session, endpoint, form)
+            except (SearchBlocked, SearchUnavailable) as e:
+                errors.append(e)
+                continue
+            endpoint_ok = True
+            break
+        if not endpoint_ok:
+            break  # both endpoints failed: stop now instead of hammering a throttled service
+
+        for page_no in range(MAX_PAGES_PER_QUERY):
+            ok_requests += 1
+            for r in parse_results(page):
+                if r["url"] in raw_seen:
+                    continue
+                raw_seen.add(r["url"])
+                lead = result_to_lead(r, keyword, location)
+                if lead:
+                    collected.append(lead)
+            if len(merge_leads([dict(x) for x in collected])) >= max_results:
+                break
+            nxt = next_page_data(page)
+            if not nxt or page_no == MAX_PAGES_PER_QUERY - 1:
+                break
+            time.sleep(0.4 + random.random() * 0.4)
+            try:
+                page = _ddg_post(session, endpoint, nxt)
+            except (SearchBlocked, SearchUnavailable) as e:
+                errors.append(e)
+                break
+        time.sleep(0.4)
+
+    if ok_requests == 0:
+        blocked = [e for e in errors if isinstance(e, SearchBlocked)]
+        if blocked:
+            raise SearchBlocked(str(blocked[-1]))
+        raise SearchUnavailable(str(errors[-1]) if errors else "no response")
+
+    merged = merge_leads(collected)[: int(max_results)]
+    return leads_to_frame(merged), location
 
 
 # ----------------------------------------------------------------------------
@@ -681,8 +815,7 @@ def section_header(eyebrow: str, title: str, sub: str = "") -> None:
 def render_footer() -> None:
     st.markdown(
         '<div class="foot">© 2026 <a href="https://b2bprospects.io" target="_blank">B2BProspects.io</a><br>'
-        'Business data © <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap contributors</a>'
-        " (ODbL) · Served via the Overpass API</div>",
+        "Business data collected from public search results</div>",
         unsafe_allow_html=True,
     )
 
@@ -708,7 +841,7 @@ with st.sidebar:
     )
     st.divider()
     st.markdown(
-        '<div class="badge-ok">✅ OpenStreetMap Data Pipeline Active (No Billing Required)</div>',
+        '<div class="badge-ok">✅ Live Search Pipeline Active (No Billing Required)</div>',
         unsafe_allow_html=True,
     )
     st.write("")
@@ -716,11 +849,11 @@ with st.sidebar:
         "Max results per search",
         options=[25, 50, 100, 200, 300],
         value=100,
-        help="Larger searches take longer on the free public OpenStreetMap servers.",
+        help="Larger searches take a little longer because more result pages are fetched.",
     )
     st.markdown(
-        '<div class="tip"><b>No API key needed.</b> Data comes from OpenStreetMap, which is community maintained. '
-        "Coverage varies by city, and some businesses have no website or phone listed. "
+        '<div class="tip"><b>No API key needed.</b> Leads are collected from public search results. '
+        "Phone numbers and addresses appear only when the listing shows them. "
         "City-level locations such as <b>Houston, Texas</b> work best.</div>",
         unsafe_allow_html=True,
     )
@@ -733,7 +866,7 @@ with st.sidebar:
 # ----------------------------------------------------------------------------
 st.markdown(
     '<div class="hero">'
-    '<span class="hero-badge"><i></i>Free OpenStreetMap Intelligence</span>'
+    '<span class="hero-badge"><i></i>Live Search Intelligence</span>'
     '<h1>🎯 B2B<span class="grad">Prospects.io</span><span class="sep">|</span>Elite Prospecting Portal</h1>'
     "<p>Surface local businesses that are ready to buy. Find companies with no website, a social-media-only "
     "presence or incomplete listings, then turn them into agency clients.</p>"
@@ -745,7 +878,7 @@ st.markdown(
 # SEARCH DASHBOARD
 # ----------------------------------------------------------------------------
 with st.container(key="card_search"):
-    section_header("Step 1", "Search Dashboard", "Pick a niche and a market. We pull live data from OpenStreetMap.")
+    section_header("Step 1", "Search Dashboard", "Pick a niche and a market. We pull live data from public search results.")
     c1, c2, c3 = st.columns([3, 3, 1.5], vertical_alignment="bottom")
     keyword = c1.text_input("Target Industry / Keyword", placeholder="e.g. plumbers, dentists, roofing")
     location = c2.text_input("Target Location", placeholder="e.g. Houston, Texas")
@@ -759,26 +892,24 @@ if search_clicked:
         st.warning("The keyword needs at least one letter or number, for example “plumbers”.")
     else:
         try:
-            with st.spinner("Searching OpenStreetMap... large cities can take up to a minute."):
+            with st.spinner("Searching public listings..."):
                 df, place_name = fetch_leads(keyword, location, max_results)
             if df.empty:
                 st.session_state["leads"] = None
                 st.warning(
-                    f"No businesses found for “{keyword}” in “{location}”. OpenStreetMap coverage varies, "
-                    "so try a broader keyword (for example “dentist”) or a larger area."
+                    f"No businesses found for “{keyword}” in “{location}”. "
+                    "Try a broader keyword (for example “dentist”) or a larger area."
                 )
             else:
                 st.session_state["leads"] = df
                 st.session_state["meta"] = f"{keyword} — {place_name}"
-        except LocationNotFound:
-            st.warning(f"Couldn't find “{location}”. Try a city and state or country, such as “Houston, Texas”.")
-        except GeocodeError as e:
-            st.error(f"🌐 The OpenStreetMap location service is unreachable right now. Please retry shortly. ({e})")
-        except OverpassError as e:
+        except SearchBlocked:
             st.error(
-                "⏳ The free OpenStreetMap servers are busy or the search timed out. Wait a minute and retry, "
-                f"or use a smaller area or fewer results. ({e})"
+                "⏳ The search provider is temporarily throttling requests. Wait about a minute and retry, "
+                "or lower the max results."
             )
+        except SearchUnavailable as e:
+            st.error(f"🌐 The search service is unreachable right now. Please retry shortly. ({e})")
         except Exception as e:
             st.error(f"Unexpected error: {e}")
 
@@ -823,13 +954,13 @@ def pct(n: int) -> str:
 st.markdown(
     f'<div class="status"><span><span class="dot"></span><b>{total}</b> prospects loaded for '
     f'<b>{esc(st.session_state["meta"])}</b></span>'
-    f'<span class="src">Source: OpenStreetMap via Overpass API · results cached for 60 minutes</span></div>',
+    f'<span class="src">Source: public search results · results cached for 60 minutes</span></div>',
     unsafe_allow_html=True,
 )
 
 st.markdown(
     '<div class="mgrid">'
-    + metric_card("📇", "Total Leads Found", str(total), "Named businesses from OpenStreetMap", "#5b2fd6")
+    + metric_card("📇", "Total Leads Found", str(total), "Named businesses from public search", "#5b2fd6")
     + metric_card("💎", "High-Value Leads", str(high_value), f"<b>{pct(high_value)}</b> match 2+ agency criteria", "#8b5cf6")
     + metric_card("⚡", "Quick Wins", str(quick_wins), f"<b>{pct(quick_wins)}</b> have no website and a phone number", "#10b981")
     + metric_card("✉️", "Emails Found", str(with_email), f"<b>{pct(with_email)}</b> list a public email address", "#f59e0b")
