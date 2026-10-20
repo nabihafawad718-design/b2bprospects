@@ -368,6 +368,12 @@ CATEGORY_RULES: list[tuple[tuple[str, ...], list[tuple[str, str]]]] = [
     (("pet shop", "pet store"), [("shop", "pet")]),
     (("optician", "eyewear"), [("shop", "optician")]),
     (("travel agency", "travel agent"), [("shop", "travel_agency")]),
+    (("marketing agency", "advertising", "web design", "digital agency"),
+     [("office", "advertising_agency"), ("office", "it")]),
+    (("tailor", "tailoring"), [("craft", "tailor")]),
+    (("printing", "print shop"), [("craft", "printer"), ("shop", "copyshop")]),
+    (("sign maker", "signage"), [("craft", "sign_maker")]),
+    (("mobile shop", "phone repair"), [("shop", "mobile_phone"), ("craft", "electronics_repair")]),
     (("software", "it service", "it company"), [("office", "it")]),
 ]
 
@@ -410,16 +416,12 @@ def tag_selectors(keyword: str) -> list[str]:
     if pairs:
         return [f'["{k}"="{v}"]["name"]' for k, v in pairs]
 
-    # Fallback for niches not in the table: match the term against tag values and business names.
+    # Fallback for niches not in the table: match the term against the main OSM category tags.
     term = _stem_phrase(keyword)
     if not term:
         return []
     value_term = term.replace(" ", "_")
-    keys = "|".join(CATEGORY_KEYS)
-    return [
-        f'[~"^({keys})$"~"{value_term}",i]["name"]',
-        f'["name"~"{term}",i]',
-    ]
+    return [f'["{k}"~"{value_term}",i]["name"]' for k in CATEGORY_KEYS]
 
 
 def build_overpass_query(keyword: str, scope: dict, limit: int) -> str:
@@ -434,7 +436,7 @@ def build_overpass_query(keyword: str, scope: dict, limit: int) -> str:
         header = ""
         suffix = f"({south:.6f},{west:.6f},{north:.6f},{east:.6f})"
     body = "\n".join(f"  nwr{sel}{suffix};" for sel in selectors)
-    return f"[out:json][timeout:60];\n{header}(\n{body}\n);\nout center tags {int(limit)};"
+    return f"[out:json][timeout:45];\n{header}(\n{body}\n);\nout center tags {int(limit)};"
 
 
 def geocode_location(location: str) -> dict:
@@ -481,39 +483,40 @@ def geocode_location(location: str) -> dict:
 
 def run_overpass(query: str) -> list[dict]:
     """POST the query to public Overpass servers with retry and failover."""
-    last_error = "unknown error"
+    errors: list[str] = []
     for url in OVERPASS_ENDPOINTS:
+        host = urlparse(url).hostname
         for attempt in range(2):
             try:
-                resp = requests.post(url, data={"data": query}, headers=HTTP_HEADERS, timeout=(10, 90))
+                resp = requests.post(url, data={"data": query}, headers=HTTP_HEADERS, timeout=(10, 60))
             except requests.exceptions.Timeout:
-                last_error = f"{url} timed out"
+                errors.append(f"{host}: timed out")
                 break
             except requests.exceptions.RequestException as e:
-                last_error = f"{url}: {e}"
+                errors.append(f"{host}: {e}")
                 break
 
             if resp.status_code == 200:
                 try:
                     payload = resp.json()
                 except ValueError:
-                    last_error = f"{url} returned unreadable data"
+                    errors.append(f"{host}: unreadable data")
                     break
                 elements = payload.get("elements", [])
                 remark = str(payload.get("remark", ""))
                 if "runtime error" in remark and not elements:
-                    last_error = remark
+                    errors.append(f"{host}: query too heavy ({remark[:80]})")
                     break
                 return elements
 
             if resp.status_code in (429, 502, 503, 504):
-                last_error = f"{url} is busy (HTTP {resp.status_code})"
+                errors.append(f"{host}: busy (HTTP {resp.status_code})")
                 time.sleep(2 * (attempt + 1))
                 continue
 
-            last_error = f"{url} returned HTTP {resp.status_code}"
+            errors.append(f"{host}: HTTP {resp.status_code}")
             break
-    raise OverpassError(last_error)
+    raise OverpassError(" | ".join(errors) or "unknown error")
 
 
 def _first_value(tags: dict, keys: tuple[str, ...]) -> str | None:
