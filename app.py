@@ -4,10 +4,15 @@ from __future__ import annotations
 import hmac
 import html
 import io
-import random
+import ipaddress
+import os
 import re
+import socket
 import time
-from urllib.parse import parse_qs, quote_plus, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
+from functools import lru_cache
+from urllib.parse import quote_plus, unquote, urljoin, urlparse
 
 import pandas as pd
 import requests
@@ -21,7 +26,7 @@ CHECKOUT_URL = "https://b2bprospects.io"
 
 st.set_page_config(
     page_title="B2BProspects.io | Elite Prospecting Portal",
-    page_icon="🎯",
+    page_icon="static/favicon.ico",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -297,14 +302,20 @@ def inject_css(hide_grid_toolbar: bool) -> None:
 
 
 # ----------------------------------------------------------------------------
-# SEARCH DATA LAYER (DuckDuckGo public search index via requests + regex)
+# SEARCH DATA LAYER (public SearXNG instances via requests + regex)
 # ----------------------------------------------------------------------------
 class SearchBlocked(Exception):
-    """DuckDuckGo throttled or challenged the request (rate limit / bot check)."""
+    """Every SearXNG instance tried throttled or refused the request (HTTP 403/429)."""
 
 
 class SearchUnavailable(Exception):
-    """DuckDuckGo could not be reached or returned unusable pages."""
+    """No SearXNG instance could be reached or returned usable results."""
+
+
+class _InstanceFailure(Exception):
+    def __init__(self, msg: str, blocked: bool = False):
+        super().__init__(msg)
+        self.blocked = blocked
 
 
 SOCIAL_DOMAINS = (
@@ -329,28 +340,46 @@ NOISE_DOMAINS = (
     "zillow.com", "realtor.com", "trulia.com", "redfin.com", "wikihow.com", "investopedia.com",
 )
 
-DDG_ENDPOINTS = (
-    "https://html.duckduckgo.com/html/",
-    "https://lite.duckduckgo.com/lite/",
+# SearXNG: https://searx.space is the public directory of live instances (it is not a search
+# endpoint itself). We read its instance list, rank by speed, and fail over between instances.
+# For the most reliable setup, self-host SearXNG and set SEARXNG_URL in .streamlit/secrets.toml
+# or as an environment variable; that one instance is then used exclusively.
+SEARX_SPACE_URL = "https://searx.space/data/instances.json"
+SEARX_SEED_INSTANCES = (
+    "https://searx.be",
+    "https://searx.tiekoetter.com",
+    "https://priv.au",
+    "https://search.ononoki.org",
+    "https://paulgo.io",
 )
-USER_AGENTS = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
-)
-MAX_PAGES_PER_QUERY = 4
-REQUEST_TIMEOUT = (6, 15)
+MAX_PAGES_PER_QUERY = 3
+MAX_INSTANCE_TRIES = 6
+INSTANCE_COOLDOWN_S = 600
+REQUEST_TIMEOUT = (4, 8)
+SEARCH_BUDGET_S = 30
+EMAIL_WORKERS = 16
+EMAIL_BUDGET_S = 18
+PAGE_MAX_BYTES = 400_000
 
-COLUMNS = ["Company Name", "Category", "Website", "Phone Number", "Email", "Physical Address", "Map"]
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+_JSON_HEADERS = {"User-Agent": _UA, "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9"}
+_HTML_HEADERS = {
+    "User-Agent": _UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+NO_DECISION_MAKER = "Request Contact Key"
+COLUMNS = [
+    "Company Name", "Decision Maker", "Category", "Website", "Phone Number", "Email",
+    "Physical Address", "Map",
+]
 
 # --- regexes ---------------------------------------------------------------
-_LINK_RE = re.compile(r"<a\b([^>]*)>(.*?)</a>", re.S | re.I)
-_SNIPPET_RE = re.compile(
-    r"""class=["'][^"']*result[_-]{1,2}snippet[^"']*["'][^>]*>(.*?)</(?:a|td|div)>""", re.S | re.I
-)
 _TAG_RE = re.compile(r"<[^>]+>")
-_FORM_RE = re.compile(r"<form\b[^>]*>(.*?)</form>", re.S | re.I)
-_INPUT_RE = re.compile(r"<input\b([^>]*)>", re.I)
 _PHONE_RE = re.compile(
     r"(?<![\d\-/])(?:\+?1[\s.\-]?)?(?:\(\d{3}\)|\d{3})[\s.\-]?\d{3}[\s.\-]?\d{4}(?![\d\-/])"
     r"|(?<![\w])\+\d{1,3}[\s\-]?\(?\d{2,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}(?![\d])"
@@ -383,7 +412,51 @@ _SITE_LABELS = (
     "facebook", "instagram", "yelp", "linkedin", "twitter", "youtube", "tiktok", "yellow pages",
     "mapquest", "better business bureau", "bbb", "angi", "homeadvisor", "thumbtack", "nextdoor",
 )
-_BLOCK_MARKERS = ("anomaly-modal", "g-recaptcha", "unfortunately, bots use duckduckgo", "anomaly.js")
+
+# SearXNG HTML fallback (used when an instance has the JSON format disabled)
+_ARTICLE_SPLIT = re.compile(r"(?=<article\b)", re.I)
+_RESULT_DIV_SPLIT = re.compile(r"""(?=<div\b[^>]*class=["'][^"']*\bresult\b[^"']*["'])""", re.I)
+_H3_LINK_RE = re.compile(r"<h3[^>]*>\s*<a\b([^>]*)>(.*?)</a>", re.S | re.I)
+_CONTENT_RE = re.compile(
+    r"""<p\b[^>]*class=["'][^"']*\bcontent\b[^"']*["'][^>]*>(.*?)</p>""", re.S | re.I
+)
+
+# Decision maker: "Name, Owner" / "Owner: Name" / "founded by Name"
+_TOKEN = r"[A-Z][a-z'\-]{1,14}(?:[A-Z][a-z]{2,10})?"
+_NAME = rf"(?P<name>(?:Dr\.\s)?{_TOKEN}(?:\s[A-Z]\.)?(?:\s{_TOKEN}){{1,2}})"
+_ROLE = r"(?:co-?\s?founder|founder|owner|ceo|chief\s+executive\s+officer|president|proprietor)"
+_DM_PATTERNS = (
+    re.compile(rf"{_NAME}\s*(?:,|\(|-|–|—|\||:)\s*(?:the\s+|our\s+)?(?i:(?P<role>{_ROLE}))\b"),
+    re.compile(
+        rf"(?i:\b(?P<role>{_ROLE}))(?:\s*(?:&|and|/)\s*(?i:ceo|owner|founder|president))?"
+        rf"\s*(?:[:\-–—,]|(?i:\bis\b)|(?i:\bnamed\b))\s*{_NAME}"
+    ),
+    re.compile(
+        r"(?i:\b(?P<role>founded|owned|operated|run|started|established)"
+        rf"(?:\s+and\s+(?:owned|operated|run))?\s+by)\s+{_NAME}"
+    ),
+)
+_ROLE_LABELS = {
+    "cofounder": "Co-Founder", "founder": "Founder", "founded": "Founder", "started": "Founder",
+    "established": "Founder", "owner": "Owner", "owned": "Owner", "operated": "Owner", "run": "Owner",
+    "proprietor": "Owner", "ceo": "CEO", "chiefexecutiveofficer": "CEO", "president": "President",
+}
+_NAME_STOPWORDS = {
+    "the", "our", "meet", "about", "contact", "home", "owner", "founder", "ceo", "president", "company",
+    "services", "service", "llc", "inc", "ltd", "corp", "group", "team", "family", "business", "operated",
+    "owned", "licensed", "insured", "free", "best", "top", "call", "email", "request", "get", "ask",
+    "hire", "visit", "learn", "view", "read", "click", "serving", "since", "located", "welcome", "hello",
+    "plumbing", "plumber", "plumbers", "roofing", "roofer", "electric", "electrical", "dental", "dentist",
+    "restaurant", "cafe", "salon", "repair", "auto", "construction", "contractor", "contractors",
+    "landscaping", "cleaning", "legal", "law", "firm", "attorney", "medical", "clinic", "health", "care",
+    "homes", "heating", "cooling", "air", "hvac", "pest", "control", "painting", "painters", "solutions",
+    "systems", "enterprises", "associates", "partners", "brothers", "sons", "co", "and", "of", "for",
+    "january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
+    "november", "december", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+}
+_IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".css", ".js")
+_CONTACT_PATH_RE = re.compile(r"contact|about|team|reach|owner|staff|who-we-are|our-story", re.I)
+_HREF_RE = re.compile(r"""<a\b[^>]*\bhref\s*=\s*["']([^"'#][^"']*)["']""", re.I)
 
 
 def sanitize_term(text: str) -> str:
@@ -400,7 +473,7 @@ def _norm(text: str) -> str:
 
 
 def _strip_html(fragment: str) -> str:
-    return re.sub(r"\s+", " ", html.unescape(_TAG_RE.sub(" ", fragment))).strip()
+    return re.sub(r"\s+", " ", html.unescape(_TAG_RE.sub(" ", fragment or ""))).strip()
 
 
 def _attr(attrs: str, name: str) -> str | None:
@@ -410,103 +483,164 @@ def _attr(attrs: str, name: str) -> str | None:
     return next(g for g in m.groups() if g is not None)
 
 
-# --- HTTP ------------------------------------------------------------------
-def _new_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(
-        {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://duckduckgo.com/",
-            "Origin": "https://duckduckgo.com",
-        }
-    )
-    return s
-
-
-def _ddg_post(session: requests.Session, url: str, data: dict) -> str:
-    """POST to a DuckDuckGo endpoint with short retries. Raises SearchBlocked / SearchUnavailable."""
-    last = "unknown error"
-    blocked = False
-    for attempt in range(3):
+# --- SearXNG instances -------------------------------------------------------
+def searxng_override() -> str | None:
+    """A self-hosted instance from secrets.toml (SEARXNG_URL) or the environment, if configured."""
+    for getter in (lambda: st.secrets["SEARXNG_URL"], lambda: os.environ["SEARXNG_URL"]):
         try:
-            resp = session.post(url, data=data, timeout=REQUEST_TIMEOUT)
-        except requests.exceptions.RequestException as e:
-            last = str(e)
-            time.sleep(0.8 * (attempt + 1))
+            value = str(getter()).strip().rstrip("/")
+        except Exception:
             continue
+        if value.startswith("http"):
+            return value
+    return None
 
-        body = resp.text or ""
-        if resp.status_code in (202, 403, 418, 429) or any(m in body.lower() for m in _BLOCK_MARKERS):
-            blocked = True
-            last = f"HTTP {resp.status_code}"
-            time.sleep(1.5 * (attempt + 1) + random.random())
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def discover_instances() -> list[str]:
+    """Live, fast, normal-web SearXNG instances from searx.space. Raises on failure (not cached)."""
+    resp = requests.get(SEARX_SPACE_URL, headers=_JSON_HEADERS, timeout=(5, 15))
+    resp.raise_for_status()
+    instances = resp.json().get("instances", {})
+    ranked: list[tuple[float, str]] = []
+    for url, info in instances.items():
+        try:
+            if not url.startswith("https://") or ".onion" in url or ".i2p" in url:
+                continue
+            if info.get("network_type") != "normal":
+                continue
+            http_info = info.get("http") or {}
+            if http_info.get("status_code") != 200 or http_info.get("error"):
+                continue
+            search = (info.get("timing") or {}).get("search") or {}
+            ok = search.get("success_percentage")
+            if isinstance(ok, (int, float)) and ok < 90:
+                continue
+            median = (search.get("all") or {}).get("median")
+            ranked.append((float(median) if isinstance(median, (int, float)) else 9.9, url.rstrip("/")))
+        except (AttributeError, TypeError, ValueError):
             continue
-        if resp.status_code >= 500:
-            last = f"HTTP {resp.status_code}"
-            time.sleep(1.0 * (attempt + 1))
+    ranked.sort()
+    return [u for _, u in ranked[:12]]
+
+
+@st.cache_resource
+def _instance_cooldowns() -> dict[str, float]:
+    """Instances that recently failed -> time (epoch) until which we skip them."""
+    return {}
+
+
+def get_instances() -> list[str]:
+    override = searxng_override()
+    if override:
+        return [override]
+    try:
+        found = discover_instances()
+    except Exception:
+        found = []
+    ordered = list(found) + [u for u in SEARX_SEED_INSTANCES if u not in found]
+    return ordered
+
+
+# --- SearXNG search ----------------------------------------------------------
+def parse_searx_html(page_html: str) -> list[dict]:
+    """Parse the default SearXNG HTML results page (fallback when JSON is disabled)."""
+    parts = _ARTICLE_SPLIT.split(page_html)
+    if len(parts) <= 1:
+        parts = _RESULT_DIV_SPLIT.split(page_html)
+    results = []
+    for block in parts[1:]:
+        lm = _H3_LINK_RE.search(block)
+        if not lm:
             continue
-        if resp.status_code != 200:
-            raise SearchUnavailable(f"HTTP {resp.status_code}")
-        return body
-    if blocked:
-        raise SearchBlocked(last)
-    raise SearchUnavailable(last)
-
-
-# --- result-page parsing -----------------------------------------------------
-def _unwrap_ddg_href(href: str) -> str | None:
-    href = html.unescape(href).strip()
-    if href.startswith("//"):
-        href = "https:" + href
-    parsed = urlparse(href)
-    host = (parsed.hostname or "").lower()
-    if host.endswith("duckduckgo.com"):
-        if parsed.path.startswith("/l/"):  # organic result redirect; ads use /y.js and are skipped
-            target = parse_qs(parsed.query).get("uddg", [""])[0]
-            return target if target.startswith("http") else None
-        return None
-    return href if href.startswith("http") else None
-
-
-def parse_results(page_html: str) -> list[dict]:
-    """Extract organic results (title, url, snippet) from the HTML or Lite results page."""
-    hits: list[tuple[int, int, str, str]] = []
-    for m in _LINK_RE.finditer(page_html):
-        attrs = m.group(1)
-        cls = _attr(attrs, "class") or ""
-        if "result__a" not in cls and "result-link" not in cls:
-            continue
-        href = _attr(attrs, "href")
+        href = _attr(lm.group(1), "href")
         if not href:
             continue
-        url = _unwrap_ddg_href(href)
-        hits.append((m.start(), m.end(), url or "", _strip_html(m.group(2))))
-
-    results = []
-    for i, (_, end, url, title) in enumerate(hits):
-        if not url or not title:
+        url = html.unescape(href).strip()
+        if not url.startswith("http"):
             continue
-        region_end = hits[i + 1][0] if i + 1 < len(hits) else len(page_html)
-        sm = _SNIPPET_RE.search(page_html, end, region_end)
-        results.append({"url": url, "title": title, "snippet": _strip_html(sm.group(1)) if sm else ""})
+        cm = _CONTENT_RE.search(block)
+        results.append({"url": url, "title": _strip_html(lm.group(2)), "snippet": _strip_html(cm.group(1)) if cm else ""})
     return results
 
 
-def next_page_data(page_html: str) -> dict | None:
-    """Return the form fields that request the next results page, or None on the last page."""
-    best: dict | None = None
-    best_s = -1
-    for fm in _FORM_RE.finditer(page_html):
-        fields = {}
-        for im in _INPUT_RE.finditer(fm.group(1)):
-            name, value = _attr(im.group(1), "name"), _attr(im.group(1), "value")
-            if name:
-                fields[name] = html.unescape(value or "")
-        if "s" in fields and "q" in fields and fields["s"].isdigit() and int(fields["s"]) > best_s:
-            best, best_s = fields, int(fields["s"])
-    return best if best_s > 0 else None
+def _searx_fetch_page(base: str, query: str, page: int) -> list[dict]:
+    """One results page from one instance: JSON first, then HTML. Raises _InstanceFailure."""
+    params = {"q": query, "pageno": page, "language": "en-US", "safesearch": 0, "categories": "general"}
+    endpoint = f"{base}/search"
+
+    try:
+        resp = requests.get(endpoint, params={**params, "format": "json"}, headers=_JSON_HEADERS, timeout=REQUEST_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        raise _InstanceFailure(str(e)) from e
+    if resp.status_code == 429:
+        raise _InstanceFailure("HTTP 429", blocked=True)
+    if resp.status_code == 200:
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("results"), list):
+            results = [
+                {"url": it["url"], "title": _strip_html(it.get("title", "")), "snippet": _strip_html(it.get("content", ""))}
+                for it in data["results"]
+                if isinstance(it, dict) and str(it.get("url", "")).startswith("http")
+            ]
+            if not results and page == 1 and data.get("unresponsive_engines"):
+                raise _InstanceFailure("search engines unresponsive")
+            return results
+
+    # JSON disabled (typically HTTP 403) or not JSON: read the HTML page instead.
+    try:
+        resp = requests.get(endpoint, params=params, headers=_HTML_HEADERS, timeout=REQUEST_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        raise _InstanceFailure(str(e)) from e
+    if resp.status_code in (403, 429):
+        raise _InstanceFailure(f"HTTP {resp.status_code}", blocked=True)
+    if resp.status_code != 200:
+        raise _InstanceFailure(f"HTTP {resp.status_code}")
+    results = parse_searx_html(resp.text)
+    if not results and page == 1:
+        raise _InstanceFailure("no parsable results")
+    return results
+
+
+def _run_query(query: str, instances: list[str], cooldowns: dict, start: int, deadline: float) -> tuple[list[dict], list[tuple[bool, str]]]:
+    """Fetch up to MAX_PAGES_PER_QUERY pages for one query, failing over between instances."""
+    out: list[dict] = []
+    failures: list[tuple[bool, str]] = []
+    n = len(instances)
+    cursor = start
+    for page in range(1, MAX_PAGES_PER_QUERY + 1):
+        page_results = None
+        tries = 0
+        for k in range(n):
+            if tries >= MAX_INSTANCE_TRIES or time.monotonic() > deadline:
+                break
+            idx = (cursor + k) % n
+            base = instances[idx]
+            if cooldowns.get(base, 0) > time.time():
+                continue
+            tries += 1
+            try:
+                page_results = _searx_fetch_page(base, query, page)
+                cursor = idx  # stick with the instance that worked
+                break
+            except _InstanceFailure as e:
+                cooldowns[base] = time.time() + INSTANCE_COOLDOWN_S
+                failures.append((e.blocked, f"{urlparse(base).hostname}: {e}"))
+        if not page_results:
+            break
+        out.extend(page_results)
+    return out, failures
+
+
+def _search_queries(keyword: str, location: str) -> list[str]:
+    return [
+        f"{keyword} in {location}",
+        f"{keyword} {location} phone address",
+        f"{keyword} {location} owner OR founder OR CEO",
+    ]
 
 
 # --- lead extraction ---------------------------------------------------------
@@ -583,14 +717,6 @@ def _first_address(text: str) -> str | None:
     return re.sub(r"\s+", " ", m.group(0)).strip(" ,") if m else None
 
 
-def _first_email(text: str) -> str | None:
-    for m in _EMAIL_RE.finditer(text):
-        email = m.group(0).lower()
-        if not email.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg")):
-            return email
-    return None
-
-
 def maps_link(name: str, location: str) -> str:
     return "https://www.google.com/maps/search/?api=1&query=" + quote_plus(f"{name} {location}")
 
@@ -624,10 +750,11 @@ def result_to_lead(r: dict, keyword: str, location: str) -> dict | None:
         "_kind": kind,
         "_host": host,
         "Company Name": name,
+        "Decision Maker": None,
         "Category": keyword.strip().title() or None,
         "Website": website,
         "Phone Number": _first_phone(text),
-        "Email": _first_email(text),
+        "Email": None,
         "Physical Address": _first_address(snippet),
         "Map": maps_link(name, location),
     }
@@ -646,7 +773,6 @@ def merge_leads(leads: list[dict]) -> list[dict]:
             by_key.setdefault(name_key, lead)
             order.append(key)
             continue
-        # merge into existing row
         if lead["_kind"] == "own" and existing["_kind"] != "own":
             for col in ("Phone Number", "Email", "Physical Address"):
                 lead[col] = lead[col] or existing[col]
@@ -667,74 +793,239 @@ def merge_leads(leads: list[dict]) -> list[dict]:
     return out
 
 
+# --- Decision Maker (regex over public search snippets) -----------------------
+def _valid_person(name: str, banned: set[str]) -> bool:
+    tokens = [t for t in re.findall(r"[A-Za-z'\-]+", name) if t.lower() != "dr"]
+    if len(tokens) < 2:
+        return False
+    for t in tokens:
+        low = t.lower().strip("'-")
+        if low in _NAME_STOPWORDS or low in banned:
+            return False
+    return True
+
+
+def extract_decision_maker(texts: list[str], banned: set[str]) -> str | None:
+    """First 'Name (Role)' found in the texts, matching CEO / Founder / Owner style patterns."""
+    for text in texts:
+        found = []
+        for pattern in _DM_PATTERNS:
+            for m in pattern.finditer(text):
+                found.append((m.start(), m.group("name").strip(), m.group("role")))
+        for _, name, role in sorted(found):
+            if _valid_person(name, banned):
+                label = _ROLE_LABELS.get(re.sub(r"[^a-z]", "", role.lower()), role.title())
+                return f"{name} ({label})"
+    return None
+
+
+def _lead_texts(lead: dict, raw: list[dict]) -> list[str]:
+    """Search-result text that belongs to this business: same domain first, then name mentions."""
+    host, name_norm = lead["_host"], _norm(lead["Company Name"])
+    same_domain, mentions = [], []
+    for r in raw:
+        text = f"{r['title']}. {r['snippet']}"
+        r_host = website_host(r["url"])
+        if lead["_kind"] == "own" and (r_host == host or r_host.endswith("." + host)):
+            same_domain.append(text)
+        elif len(name_norm) >= 6 and name_norm in _norm(text):
+            mentions.append(text)
+    return same_domain + mentions
+
+
+def attach_decision_makers(leads: list[dict], raw: list[dict], keyword: str, location: str) -> None:
+    generic = {w for w in re.findall(r"[a-z]{3,}", f"{keyword} {location}".lower())}
+    for lead in leads:
+        banned = generic | {w for w in re.findall(r"[a-z]{3,}", lead["Company Name"].lower())}
+        banned |= {w for w in re.findall(r"[a-z]{3,}", lead["_host"].split(".")[0])}
+        lead["Decision Maker"] = extract_decision_maker(_lead_texts(lead, raw), banned) or NO_DECISION_MAKER
+
+
+# --- Email finder (strict: email domain must match the website domain) ---------
+def email_matches_site(email: str, site_host: str) -> bool:
+    if "@" not in email:
+        return False
+    email_domain = email.rsplit("@", 1)[1].lower().strip(".")
+    host = site_host.lower().strip(".")
+    host = host[4:] if host.startswith("www.") else host
+    return bool(email_domain) and (
+        email_domain == host or host.endswith("." + email_domain) or email_domain.endswith("." + host)
+    )
+
+
+def pick_site_email(text: str, site_host: str) -> str | None:
+    text = html.unescape(text)
+    candidates = [m.group(1) for m in re.finditer(r"mailto:([^\"'?<>\s]+)", text, re.I)]
+    candidates += _EMAIL_RE.findall(text)
+    for cand in candidates:
+        m = _EMAIL_RE.search(unquote(cand))
+        if not m:
+            continue
+        email = m.group(0).lower()
+        if email.endswith(_IMG_EXT):
+            continue
+        if email_matches_site(email, site_host):
+            return email
+    return None
+
+
+@lru_cache(maxsize=4096)
+def _is_public_host(host: str) -> bool:
+    """SSRF guard: only fetch hosts that resolve exclusively to public internet addresses."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            if not ipaddress.ip_address(info[4][0].split("%")[0]).is_global:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+def _fetch_html(url: str) -> tuple[str, str] | None:
+    """GET a page (max 3 redirects, each re-checked, 400 KB cap). Returns (final_url, html)."""
+    for _ in range(4):
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return None
+        if parsed.port not in (None, 80, 443) or not _is_public_host(parsed.hostname):
+            return None
+        try:
+            resp = requests.get(url, headers=_HTML_HEADERS, timeout=(4, 7), allow_redirects=False, stream=True)
+        except requests.exceptions.RequestException:
+            return None
+        try:
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location")
+                if not location:
+                    return None
+                url = urljoin(url, location)
+                continue
+            if resp.status_code != 200 or "html" not in resp.headers.get("Content-Type", "html").lower():
+                return None
+            body, size = [], 0
+            for chunk in resp.iter_content(65536):
+                body.append(chunk)
+                size += len(chunk)
+                if size >= PAGE_MAX_BYTES:
+                    break
+            return url, b"".join(body).decode(resp.encoding or "utf-8", errors="replace")
+        except requests.exceptions.RequestException:
+            return None
+        finally:
+            resp.close()
+    return None
+
+
+def _contact_links(page_html: str, base_url: str, site_host: str) -> list[str]:
+    links: list[str] = []
+    for href in _HREF_RE.findall(page_html):
+        if href.lower().startswith(("mailto:", "tel:", "javascript:")):
+            continue
+        absolute = urljoin(base_url, html.unescape(href))
+        p = urlparse(absolute)
+        if not p.hostname or not email_matches_site(f"x@{p.hostname.lower()}", site_host):
+            continue
+        if _CONTACT_PATH_RE.search(p.path) and absolute not in links:
+            links.append(absolute)
+    links.sort(key=lambda u: 0 if "contact" in u.lower() else 1)
+    return links
+
+
+def find_site_email(root_url: str, site_host: str) -> str | None:
+    page = _fetch_html(root_url + "/")
+    if page is None:
+        return None
+    final_url, body = page
+    email = pick_site_email(body, site_host)
+    if email:
+        return email
+    for link in _contact_links(body, final_url, site_host)[:2]:
+        sub = _fetch_html(link)
+        if sub:
+            email = pick_site_email(sub[1], site_host)
+            if email:
+                return email
+    return None
+
+
+def attach_site_emails(leads: list[dict], raw: list[dict]) -> None:
+    """Fill Email for businesses with their own website. Domain match is mandatory."""
+    pending = []
+    for lead in leads:
+        if lead["_kind"] != "own":
+            continue
+        for text in _lead_texts(lead, raw)[:6]:
+            email = pick_site_email(text, lead["_host"])
+            if email:
+                lead["Email"] = email
+                break
+        if not lead["Email"]:
+            pending.append(lead)
+    if not pending:
+        return
+
+    pool = ThreadPoolExecutor(max_workers=EMAIL_WORKERS)
+    futures = {pool.submit(find_site_email, lead["Website"], lead["_host"]): lead for lead in pending}
+    try:
+        for fut in as_completed(futures, timeout=EMAIL_BUDGET_S):
+            try:
+                futures[fut]["Email"] = fut.result()
+            except Exception:
+                pass
+    except FuturesTimeout:
+        pass  # leave the rest without an email rather than keep the user waiting
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 def leads_to_frame(leads: list[dict]) -> pd.DataFrame:
     if not leads:
         return pd.DataFrame(columns=COLUMNS)
     df = pd.DataFrame([{c: lead.get(c) for c in COLUMNS} for lead in leads], columns=COLUMNS)
+    df["Decision Maker"] = df["Decision Maker"].fillna(NO_DECISION_MAKER)
     return df.astype(object).where(df.notna(), None).reset_index(drop=True)
-
-
-def _search_queries(keyword: str, location: str) -> list[str]:
-    return [
-        f"{keyword} in {location}",
-        f"{keyword} {location} phone address",
-        f"{keyword} {location} facebook",
-    ]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_leads(keyword: str, location: str, max_results: int) -> tuple[pd.DataFrame, str]:
-    session = _new_session()
-    collected: list[dict] = []
-    raw_seen: set[str] = set()
-    errors: list[Exception] = []
-    ok_requests = 0
+    instances = get_instances()
+    cooldowns = _instance_cooldowns()
+    queries = _search_queries(keyword, location)
+    deadline = time.monotonic() + SEARCH_BUDGET_S
 
-    for qi, query in enumerate(_search_queries(keyword, location)):
-        if len(merge_leads([dict(x) for x in collected])) >= max_results:
-            break
-        form: dict | None = {"q": query, "b": "", "kl": "us-en"}
-        endpoint_ok = False
-        for endpoint in DDG_ENDPOINTS:
-            try:
-                page = _ddg_post(session, endpoint, form)
-            except (SearchBlocked, SearchUnavailable) as e:
-                errors.append(e)
-                continue
-            endpoint_ok = True
-            break
-        if not endpoint_ok:
-            break  # both endpoints failed: stop now instead of hammering a throttled service
+    raw: list[dict] = []
+    failures: list[tuple[bool, str]] = []
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        futures = [pool.submit(_run_query, q, instances, cooldowns, i, deadline) for i, q in enumerate(queries)]
+        for fut in futures:
+            results, fails = fut.result()
+            raw.extend(results)
+            failures.extend(fails)
 
-        for page_no in range(MAX_PAGES_PER_QUERY):
-            ok_requests += 1
-            for r in parse_results(page):
-                if r["url"] in raw_seen:
-                    continue
-                raw_seen.add(r["url"])
-                lead = result_to_lead(r, keyword, location)
-                if lead:
-                    collected.append(lead)
-            if len(merge_leads([dict(x) for x in collected])) >= max_results:
-                break
-            nxt = next_page_data(page)
-            if not nxt or page_no == MAX_PAGES_PER_QUERY - 1:
-                break
-            time.sleep(0.4 + random.random() * 0.4)
-            try:
-                page = _ddg_post(session, endpoint, nxt)
-            except (SearchBlocked, SearchUnavailable) as e:
-                errors.append(e)
-                break
-        time.sleep(0.4)
+    seen_urls: set[str] = set()
+    unique_raw = []
+    for r in raw:
+        if r["url"] not in seen_urls:
+            seen_urls.add(r["url"])
+            unique_raw.append(r)
 
-    if ok_requests == 0:
-        blocked = [e for e in errors if isinstance(e, SearchBlocked)]
-        if blocked:
-            raise SearchBlocked(str(blocked[-1]))
-        raise SearchUnavailable(str(errors[-1]) if errors else "no response")
+    if not unique_raw:
+        if failures:
+            if any(blocked for blocked, _ in failures):
+                raise SearchBlocked(failures[-1][1])
+            raise SearchUnavailable(failures[-1][1])
+        return leads_to_frame([]), location
 
-    merged = merge_leads(collected)[: int(max_results)]
+    leads = [l for l in (result_to_lead(r, keyword, location) for r in unique_raw) if l]
+    merged = merge_leads(leads)[: int(max_results)]
+    attach_decision_makers(merged, unique_raw, keyword, location)
+    attach_site_emails(merged, unique_raw)
     return leads_to_frame(merged), location
 
 
@@ -834,14 +1125,14 @@ inject_css(hide_grid_toolbar=not st.session_state["unlocked"])
 # ----------------------------------------------------------------------------
 with st.sidebar:
     st.markdown(
-        '<div class="brand"><div class="brand-mark">🎯</div><div>'
-        '<div class="brand-name">B2B<span>Prospects</span></div>'
+        '<div class="brand"><div>'
+        """<div><img src="app/static/logo.png" width="38" style="vertical-align:middle; border-radius:8px; margin-right:8px;"> <span class='brand-name' style='font-weight:800; font-size:1.1rem; color:#1e1b4b;'>B2B<span style='color:#5b2fd6;'>Prospects</span></span></div>"""
         '<div class="brand-sub">Elite Prospecting Portal</div></div></div>',
         unsafe_allow_html=True,
     )
     st.divider()
     st.markdown(
-        '<div class="badge-ok">✅ Live Search Pipeline Active (No Billing Required)</div>',
+        '<div class="badge-ok">✅ Data Engine: SearXNG Active</div>',
         unsafe_allow_html=True,
     )
     st.write("")
