@@ -352,11 +352,11 @@ SEARX_SEED_INSTANCES = (
     "https://search.ononoki.org",
     "https://paulgo.io",
 )
-MAX_PAGES_PER_QUERY = 3
-MAX_INSTANCE_TRIES = 6
-INSTANCE_COOLDOWN_S = 600
-REQUEST_TIMEOUT = (4, 8)
-SEARCH_BUDGET_S = 30
+MAX_PAGES_PER_QUERY = 1
+MAX_INSTANCE_TRIES = 2
+INSTANCE_COOLDOWN_S = 900
+REQUEST_TIMEOUT = (3, 5)
+SEARCH_BUDGET_S = 40
 EMAIL_WORKERS = 16
 EMAIL_BUDGET_S = 18
 PAGE_MAX_BYTES = 400_000
@@ -1001,12 +1001,14 @@ def fetch_leads(keyword: str, location: str, max_results: int) -> tuple[pd.DataF
 
     raw: list[dict] = []
     failures: list[tuple[bool, str]] = []
-    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
-        futures = [pool.submit(_run_query, q, instances, cooldowns, i, deadline) for i, q in enumerate(queries)]
-        for fut in futures:
-            results, fails = fut.result()
-            raw.extend(results)
-            failures.extend(fails)
+    # Public SearXNG instances are shared services and often throttle bursts.
+    # Run searches sequentially so one click does not create parallel request spikes.
+    for i, query in enumerate(queries):
+        if time.monotonic() >= deadline:
+            break
+        results, fails = _run_query(query, instances, cooldowns, i, deadline)
+        raw.extend(results)
+        failures.extend(fails)
 
     seen_urls: set[str] = set()
     unique_raw = []
@@ -1196,8 +1198,9 @@ if search_clicked:
                 st.session_state["meta"] = f"{keyword} — {place_name}"
         except SearchBlocked:
             st.error(
-                "⏳ The search provider is temporarily throttling requests. Wait about a minute and retry, "
-                "or lower the max results."
+                "⏳ Public search instances are refusing requests right now. This can happen when a shared "
+                "provider applies a temporary limit. Wait 10–15 minutes before trying once more; repeated "
+                "retries may extend the restriction. Your dashboard layout and saved features are unchanged."
             )
         except SearchUnavailable as e:
             st.error(f"🌐 The search service is unreachable right now. Please retry shortly. ({e})")
