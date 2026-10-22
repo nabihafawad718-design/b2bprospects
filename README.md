@@ -36,3 +36,7 @@ streamlit run app.py
 3. Choose a permitted, reliable data source for the volume and fields you plan to sell.
 4. Implement real payment processing and server-side entitlement checks; do not rely on a hard-coded license key in client code.
 5. Add monitoring, rate limits, error handling, and privacy/terms disclosures.
+
+
+## Overpass fallback update
+The prototype tries up to three public Overpass endpoints and retries transient HTTP 502/503/504 errors once before moving on. It stops when a server explicitly returns HTTP 429 to respect rate limits. These endpoints are shared community infrastructure; this fallback improves resilience but cannot guarantee availability or complete coverage.

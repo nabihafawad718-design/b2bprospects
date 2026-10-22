@@ -986,7 +986,11 @@ def leads_to_frame(leads: list[dict]) -> pd.DataFrame:
 # This is a no-API-key prototype for validating the workflow, not a complete
 # commercial lead database. Coverage depends on OpenStreetMap contributors.
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
 OSM_USER_AGENT = "B2BProspectsPrototype/0.1 (+https://b2bprospects.io)"
 
 INDUSTRY_TAGS = {
@@ -1153,22 +1157,60 @@ def fetch_leads(keyword: str, location: str, max_results: int, search_mode: str 
         raise SearchUnavailable(f"Could not find the location '{location}'. Try a city and region, e.g. Houston, Texas.")
     lat, lon, place_name = place
     query = _overpass_query(keyword, lat, lon, search_mode, max_results)
-    try:
-        response = requests.post(
-            OVERPASS_URL,
-            data={"data": query},
-            headers={"User-Agent": OSM_USER_AGENT, "Accept": "application/json"},
-            timeout=(5, 35),
-        )
-        if response.status_code == 429:
-            raise SearchBlocked("OpenStreetMap Overpass rate limit (HTTP 429)")
-        response.raise_for_status()
-        payload = response.json()
-    except SearchBlocked:
-        raise
-    except (requests.RequestException, ValueError) as exc:
-        raise SearchUnavailable(f"OpenStreetMap query failed: {exc}") from exc
-    elements = payload.get("elements", []) if isinstance(payload, dict) else []
+    # Fail over between public Overpass instances if one is temporarily unhealthy.
+    # Keep retries limited: these are shared community services, not a bulk-data API.
+    last_error = "unknown error"
+    payload = None
+    headers = {"User-Agent": OSM_USER_AGENT, "Accept": "application/json"}
+    for endpoint in OVERPASS_ENDPOINTS:
+        for attempt in range(2):
+            try:
+                response = requests.post(
+                    endpoint,
+                    data={"data": query},
+                    headers=headers,
+                    timeout=(5, 45),
+                )
+            except requests.exceptions.Timeout:
+                last_error = f"{endpoint} timed out"
+                break
+            except requests.exceptions.RequestException as exc:
+                last_error = f"{endpoint}: {exc}"
+                break
+
+            if response.status_code == 200:
+                try:
+                    candidate = response.json()
+                except ValueError:
+                    last_error = f"{endpoint} returned unreadable data"
+                    break
+                if not isinstance(candidate, dict):
+                    last_error = f"{endpoint} returned an unexpected response"
+                    break
+                remark = str(candidate.get("remark", ""))
+                if "runtime error" in remark.lower() and not candidate.get("elements"):
+                    last_error = f"{endpoint}: {remark}"
+                    break
+                payload = candidate
+                break
+
+            if response.status_code == 429:
+                # Respect explicit rate limits; don't keep querying other public servers.
+                raise SearchBlocked(f"OpenStreetMap Overpass rate limit (HTTP 429) at {endpoint}")
+            if response.status_code in (502, 503, 504):
+                last_error = f"{endpoint} is temporarily busy (HTTP {response.status_code})"
+                if attempt == 0:
+                    time.sleep(2)
+                    continue
+                break
+            last_error = f"{endpoint} returned HTTP {response.status_code}"
+            break
+        if payload is not None:
+            break
+
+    if payload is None:
+        raise SearchUnavailable(f"OpenStreetMap query failed after trying available Overpass servers: {last_error}")
+    elements = payload.get("elements", [])
     leads = _osm_elements_to_leads(elements, keyword, location)
     leads = leads[:max(1, min(int(max_results), 100))]
     return leads_to_frame(leads), place_name
