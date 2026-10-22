@@ -1,17 +1,12 @@
-# app.py — B2BProspects.io | Elite Prospecting Portal (search-index edition)
+# app.py — B2BProspects.io | Elite Prospecting Portal (OpenStreetMap edition)
 from __future__ import annotations
 
+import hmac
 import html
 import io
-import ipaddress
-import os
 import re
-import socket
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from concurrent.futures import TimeoutError as FuturesTimeout
-from functools import lru_cache
-from urllib.parse import quote_plus, unquote, urljoin, urlparse
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -20,13 +15,33 @@ import streamlit as st
 # ----------------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------------
+LICENSE_KEY = "B2BPROSPECTS2026"  # test key; override with st.secrets["LICENSE_KEY"] in prod
+CHECKOUT_URL = "https://b2bprospects.io"
+
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
+HTTP_HEADERS = {
+    "User-Agent": "B2BProspects/1.0 (https://b2bprospects.io; lead research tool)",
+    "Accept": "application/json",
+}
+
 st.set_page_config(
     page_title="B2BProspects.io | Elite Prospecting Portal",
-    page_icon="static/favicon.ico",
+    page_icon="🎯",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+
+def get_license_key() -> str:
+    try:
+        return str(st.secrets["LICENSE_KEY"])
+    except Exception:
+        return LICENSE_KEY
 
 
 esc = html.escape
@@ -292,962 +307,301 @@ def inject_css(hide_grid_toolbar: bool) -> None:
 
 
 # ----------------------------------------------------------------------------
-# LEGACY SEARCH DATA LAYER (SearXNG; retained for reference, not used by the prototype UI)
+# OSM DATA LAYER (OpenStreetMap: Nominatim geocoder + Overpass API, no keys)
 # ----------------------------------------------------------------------------
-class SearchBlocked(Exception):
-    """Every SearXNG instance tried throttled or refused the request (HTTP 403/429)."""
+class LocationNotFound(Exception):
+    """Nominatim could not resolve the target location."""
 
 
-class SearchUnavailable(Exception):
-    """No SearXNG instance could be reached or returned usable results."""
+class GeocodeError(Exception):
+    """Nominatim was unreachable or returned an unusable response."""
 
 
-class _InstanceFailure(Exception):
-    def __init__(self, msg: str, blocked: bool = False):
-        super().__init__(msg)
-        self.blocked = blocked
+class OverpassError(Exception):
+    """All Overpass endpoints failed, timed out or were rate limited."""
 
+
+# Keyword aliases -> OSM tag filters. Aliases are matched as whole words after light stemming.
+CATEGORY_RULES: list[tuple[tuple[str, ...], list[tuple[str, str]]]] = [
+    (("plumber", "plumbing"), [("craft", "plumber")]),
+    (("electrician", "electrical"), [("craft", "electrician")]),
+    (("roofer", "roofing", "roof"), [("craft", "roofer")]),
+    (("hvac", "heating", "air conditioning", "ac repair"), [("craft", "hvac")]),
+    (("carpenter", "carpentry"), [("craft", "carpenter")]),
+    (("painter", "painting"), [("craft", "painter")]),
+    (("builder", "contractor", "general contractor", "construction"),
+     [("craft", "builder"), ("office", "construction_company")]),
+    (("landscaper", "landscaping", "gardener", "lawn care"), [("craft", "gardener")]),
+    (("locksmith",), [("craft", "locksmith"), ("shop", "locksmith")]),
+    (("photographer", "photography"), [("craft", "photographer"), ("shop", "photo")]),
+    (("dentist", "dental"), [("amenity", "dentist"), ("healthcare", "dentist")]),
+    (("doctor", "physician", "clinic"),
+     [("amenity", "doctors"), ("amenity", "clinic"), ("healthcare", "doctor")]),
+    (("pharmacy", "drugstore"), [("amenity", "pharmacy")]),
+    (("vet", "veterinarian", "veterinary"), [("amenity", "veterinary")]),
+    (("chiropractor",), [("healthcare", "chiropractor")]),
+    (("physiotherapist", "physio", "physical therapy"), [("healthcare", "physiotherapist")]),
+    (("restaurant", "dining"), [("amenity", "restaurant")]),
+    (("cafe", "coffee shop", "coffee"), [("amenity", "cafe")]),
+    (("bar", "pub"), [("amenity", "bar"), ("amenity", "pub")]),
+    (("fast food", "takeaway"), [("amenity", "fast_food")]),
+    (("bakery",), [("shop", "bakery")]),
+    (("hair salon", "hairdresser", "barber", "salon"), [("shop", "hairdresser")]),
+    (("beauty", "spa", "nail"), [("shop", "beauty")]),
+    (("gym", "fitness"), [("leisure", "fitness_centre")]),
+    (("car repair", "auto repair", "mechanic", "garage"), [("shop", "car_repair")]),
+    (("car dealer", "auto dealer", "car dealership"), [("shop", "car")]),
+    (("florist",), [("shop", "florist")]),
+    (("lawyer", "attorney", "law firm"), [("office", "lawyer")]),
+    (("accountant", "accounting", "cpa"), [("office", "accountant")]),
+    (("real estate", "realtor", "estate agent"), [("office", "estate_agent")]),
+    (("insurance",), [("office", "insurance")]),
+    (("hotel", "motel"), [("tourism", "hotel"), ("tourism", "motel")]),
+    (("school",), [("amenity", "school")]),
+    (("daycare", "kindergarten", "childcare"), [("amenity", "kindergarten"), ("amenity", "childcare")]),
+    (("bank",), [("amenity", "bank")]),
+    (("supermarket", "grocery"), [("shop", "supermarket"), ("shop", "convenience")]),
+    (("clothing", "boutique", "fashion"), [("shop", "clothes")]),
+    (("jeweler", "jewelry"), [("shop", "jewelry")]),
+    (("furniture",), [("shop", "furniture")]),
+    (("laundry", "dry cleaner", "dry cleaning"), [("shop", "laundry"), ("shop", "dry_cleaning")]),
+    (("pet shop", "pet store"), [("shop", "pet")]),
+    (("optician", "eyewear"), [("shop", "optician")]),
+    (("travel agency", "travel agent"), [("shop", "travel_agency")]),
+    (("marketing agency", "advertising", "web design", "digital agency"),
+     [("office", "advertising_agency"), ("office", "it")]),
+    (("tailor", "tailoring"), [("craft", "tailor")]),
+    (("printing", "print shop"), [("craft", "printer"), ("shop", "copyshop")]),
+    (("sign maker", "signage"), [("craft", "sign_maker")]),
+    (("mobile shop", "phone repair"), [("shop", "mobile_phone"), ("craft", "electronics_repair")]),
+    (("software", "it service", "it company"), [("office", "it")]),
+]
+
+CATEGORY_KEYS = ("amenity", "shop", "craft", "office", "healthcare", "leisure", "tourism")
 
 SOCIAL_DOMAINS = (
     "facebook.com", "fb.com", "instagram.com", "linktr.ee", "yelp.com", "twitter.com", "x.com",
     "tiktok.com", "linkedin.com", "youtube.com", "wa.me", "business.site", "sites.google.com",
 )
 
-# Business directories: the listing is real, but the business's own website is unknown.
-DIRECTORY_DOMAINS = (
-    "yellowpages.com", "superpages.com", "bbb.org", "mapquest.com", "manta.com", "angi.com",
-    "homeadvisor.com", "thumbtack.com", "nextdoor.com", "tripadvisor.com", "foursquare.com",
-    "chamberofcommerce.com", "porch.com", "houzz.com", "expertise.com", "threebestrated.com",
-    "yell.com", "cylex.us.com", "buildzoom.com", "alignable.com", "birdeye.com", "merchantcircle.com",
-    "local.yahoo.com", "maps.google.com", "google.com", "bing.com", "apple.com", "opentable.com",
-)
-
-# Never businesses: reference, jobs, forums, marketplaces, media.
-NOISE_DOMAINS = (
-    "wikipedia.org", "reddit.com", "quora.com", "pinterest.com", "indeed.com", "glassdoor.com",
-    "ziprecruiter.com", "craigslist.org", "amazon.com", "ebay.com", "walmart.com", "medium.com",
-    "forbes.com", "nytimes.com", "cnn.com", "bbc.com", "gov", "edu", "github.com", "stackoverflow.com",
-    "zillow.com", "realtor.com", "trulia.com", "redfin.com", "wikihow.com", "investopedia.com",
-)
-
-# SearXNG: https://searx.space is the public directory of live instances (it is not a search
-# endpoint itself). We read its instance list, rank by speed, and fail over between instances.
-# For the most reliable setup, self-host SearXNG and set SEARXNG_URL in .streamlit/secrets.toml
-# or as an environment variable; that one instance is then used exclusively.
-SEARX_SPACE_URL = "https://searx.space/data/instances.json"
-SEARX_SEED_INSTANCES = (
-    "https://searx.be",
-    "https://searx.tiekoetter.com",
-    "https://priv.au",
-    "https://search.ononoki.org",
-    "https://paulgo.io",
-)
-MAX_PAGES_PER_QUERY = 1
-MAX_INSTANCE_TRIES = 2
-INSTANCE_COOLDOWN_S = 900
-REQUEST_TIMEOUT = (3, 5)
-SEARCH_BUDGET_S = 40
-EMAIL_WORKERS = 16
-EMAIL_BUDGET_S = 18
-PAGE_MAX_BYTES = 400_000
-
-_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-_JSON_HEADERS = {"User-Agent": _UA, "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9"}
-_HTML_HEADERS = {
-    "User-Agent": _UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-NO_DECISION_MAKER = "Not publicly listed"
-COLUMNS = [
-    "Company Name", "Decision Maker", "Category", "Website", "Phone Number", "Email",
-    "Physical Address", "Map", "Source",
-]
-
-# --- regexes ---------------------------------------------------------------
-_TAG_RE = re.compile(r"<[^>]+>")
-_PHONE_RE = re.compile(
-    r"(?<![\d\-/])(?:\+?1[\s.\-]?)?(?:\(\d{3}\)|\d{3})[\s.\-]?\d{3}[\s.\-]?\d{4}(?![\d\-/])"
-    r"|(?<![\w])\+\d{1,3}[\s\-]?\(?\d{2,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}(?![\d])"
-)
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
-_STREET_WORDS = (
-    r"St|Street|Ave|Avenue|Blvd|Boulevard|Rd|Road|Dr|Drive|Ln|Lane|Hwy|Highway|Way|Ct|Court|"
-    r"Pkwy|Parkway|Pl|Place|Cir|Circle|Trl|Trail|Fwy|Freeway|Sq|Square"
-)
-_ADDRESS_RE = re.compile(
-    rf"\b\d{{1,6}}\s+(?:[NSEW]\.?\s+)?(?:[A-Za-z0-9.'\-]+\s+){{0,4}}?(?:{_STREET_WORDS})\b\.?"
-    r"(?:,?\s*(?:Suite|Ste|Unit|#)\s*[\w\-]+)?"
-    r"(?:,\s*[A-Za-z .'\-]+,?\s*[A-Z]{2}\.?(?:\s+\d{5}(?:-\d{4})?)?)?",
-    re.I,
-)
-_LISTICLE_RE = re.compile(
-    r"\b(top|best)\s+\d+\b|\b\d+\s+(best|top)\b|\bthe\s+best\b|\bnear\s+me\b|\btop[\s\-]rated\b|"
-    r"\blist\s+of\b|\bhow\s+to\b|\bhow\s+much\b|\bcost\s+of\b|\bprices?\b|\bvs\.?\b|\bguide\b|"
-    r"\bfind\s+(a|the)\b|\bhire\s+(a|the)\b|\bdirectory\b|\bcompanies\s+in\b",
-    re.I,
-)
-_TITLE_SEP_RE = re.compile(r"\s+[|\-–—:•·»]\s+|\s*[|•·»]\s*")
-_GENERIC_SEGMENTS = {
-    "home", "homepage", "welcome", "official site", "official website", "contact", "contact us",
-    "about", "about us", "services", "reviews", "photos", "facebook", "instagram", "yelp",
-    "linkedin", "twitter", "youtube", "tiktok", "yellow pages", "mapquest", "bbb", "better business bureau",
-    "angi", "homeadvisor", "thumbtack", "nextdoor", "foursquare", "tripadvisor",
-}
-_SITE_LABELS = (
-    "facebook", "instagram", "yelp", "linkedin", "twitter", "youtube", "tiktok", "yellow pages",
-    "mapquest", "better business bureau", "bbb", "angi", "homeadvisor", "thumbtack", "nextdoor",
-)
-
-# SearXNG HTML fallback (used when an instance has the JSON format disabled)
-_ARTICLE_SPLIT = re.compile(r"(?=<article\b)", re.I)
-_RESULT_DIV_SPLIT = re.compile(r"""(?=<div\b[^>]*class=["'][^"']*\bresult\b[^"']*["'])""", re.I)
-_H3_LINK_RE = re.compile(r"<h3[^>]*>\s*<a\b([^>]*)>(.*?)</a>", re.S | re.I)
-_CONTENT_RE = re.compile(
-    r"""<p\b[^>]*class=["'][^"']*\bcontent\b[^"']*["'][^>]*>(.*?)</p>""", re.S | re.I
-)
-
-# Decision maker: "Name, Owner" / "Owner: Name" / "founded by Name"
-_TOKEN = r"[A-Z][a-z'\-]{1,14}(?:[A-Z][a-z]{2,10})?"
-_NAME = rf"(?P<name>(?:Dr\.\s)?{_TOKEN}(?:\s[A-Z]\.)?(?:\s{_TOKEN}){{1,2}})"
-_ROLE = r"(?:co-?\s?founder|founder|owner|ceo|chief\s+executive\s+officer|president|proprietor)"
-_DM_PATTERNS = (
-    re.compile(rf"{_NAME}\s*(?:,|\(|-|–|—|\||:)\s*(?:the\s+|our\s+)?(?i:(?P<role>{_ROLE}))\b"),
-    re.compile(
-        rf"(?i:\b(?P<role>{_ROLE}))(?:\s*(?:&|and|/)\s*(?i:ceo|owner|founder|president))?"
-        rf"\s*(?:[:\-–—,]|(?i:\bis\b)|(?i:\bnamed\b))\s*{_NAME}"
-    ),
-    re.compile(
-        r"(?i:\b(?P<role>founded|owned|operated|run|started|established)"
-        rf"(?:\s+and\s+(?:owned|operated|run))?\s+by)\s+{_NAME}"
-    ),
-)
-_ROLE_LABELS = {
-    "cofounder": "Co-Founder", "founder": "Founder", "founded": "Founder", "started": "Founder",
-    "established": "Founder", "owner": "Owner", "owned": "Owner", "operated": "Owner", "run": "Owner",
-    "proprietor": "Owner", "ceo": "CEO", "chiefexecutiveofficer": "CEO", "president": "President",
-}
-_NAME_STOPWORDS = {
-    "the", "our", "meet", "about", "contact", "home", "owner", "founder", "ceo", "president", "company",
-    "services", "service", "llc", "inc", "ltd", "corp", "group", "team", "family", "business", "operated",
-    "owned", "licensed", "insured", "free", "best", "top", "call", "email", "request", "get", "ask",
-    "hire", "visit", "learn", "view", "read", "click", "serving", "since", "located", "welcome", "hello",
-    "plumbing", "plumber", "plumbers", "roofing", "roofer", "electric", "electrical", "dental", "dentist",
-    "restaurant", "cafe", "salon", "repair", "auto", "construction", "contractor", "contractors",
-    "landscaping", "cleaning", "legal", "law", "firm", "attorney", "medical", "clinic", "health", "care",
-    "homes", "heating", "cooling", "air", "hvac", "pest", "control", "painting", "painters", "solutions",
-    "systems", "enterprises", "associates", "partners", "brothers", "sons", "co", "and", "of", "for",
-    "january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
-    "november", "december", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
-}
-_IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".css", ".js")
-_CONTACT_PATH_RE = re.compile(r"contact|about|team|reach|owner|staff|who-we-are|our-story", re.I)
-_HREF_RE = re.compile(r"""<a\b[^>]*\bhref\s*=\s*["']([^"'#][^"']*)["']""", re.I)
-
 
 def sanitize_term(text: str) -> str:
-    """Lowercase letters/digits/spaces/hyphens only. Used to validate and normalise user input."""
+    """Keep only characters that are safe inside an Overpass QL string / regex."""
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 \-]", "", text.lower())).strip()
 
 
-def _host_matches(host: str, domains: tuple[str, ...]) -> bool:
-    return any(host == d or host.endswith("." + d) for d in domains)
+def _stem(word: str) -> str:
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 4 and word.endswith(("ses", "xes", "ches", "shes")):
+        return word[:-2]
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
 
 
-def _norm(text: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", text.lower())
+def _stem_phrase(text: str) -> str:
+    return " ".join(_stem(w) for w in sanitize_term(text).split())
 
 
-def _strip_html(fragment: str) -> str:
-    return re.sub(r"\s+", " ", html.unescape(_TAG_RE.sub(" ", fragment or ""))).strip()
+def tag_selectors(keyword: str) -> list[str]:
+    """Translate a free-text industry into Overpass tag selectors. Every selector requires a name."""
+    phrase = f" {_stem_phrase(keyword)} "
+    pairs: list[tuple[str, str]] = []
+    for aliases, tags in CATEGORY_RULES:
+        if any(f" {_stem_phrase(a)} " in phrase for a in aliases):
+            for pair in tags:
+                if pair not in pairs:
+                    pairs.append(pair)
+    if pairs:
+        return [f'["{k}"="{v}"]["name"]' for k, v in pairs]
+
+    # Fallback for niches not in the table: match the term against the main OSM category tags.
+    term = _stem_phrase(keyword)
+    if not term:
+        return []
+    value_term = term.replace(" ", "_")
+    return [f'["{k}"~"{value_term}",i]["name"]' for k in CATEGORY_KEYS]
 
 
-def _attr(attrs: str, name: str) -> str | None:
-    m = re.search(rf"""\b{name}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", attrs, re.I)
-    if not m:
-        return None
-    return next(g for g in m.groups() if g is not None)
-
-
-# --- SearXNG instances -------------------------------------------------------
-def searxng_override() -> str | None:
-    """A self-hosted instance from secrets.toml (SEARXNG_URL) or the environment, if configured."""
-    for getter in (lambda: st.secrets["SEARXNG_URL"], lambda: os.environ["SEARXNG_URL"]):
-        try:
-            value = str(getter()).strip().rstrip("/")
-        except Exception:
-            continue
-        if value.startswith("http"):
-            return value
-    return None
-
-
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def discover_instances() -> list[str]:
-    """Live, fast, normal-web SearXNG instances from searx.space. Raises on failure (not cached)."""
-    resp = requests.get(SEARX_SPACE_URL, headers=_JSON_HEADERS, timeout=(5, 15))
-    resp.raise_for_status()
-    instances = resp.json().get("instances", {})
-    ranked: list[tuple[float, str]] = []
-    for url, info in instances.items():
-        try:
-            if not url.startswith("https://") or ".onion" in url or ".i2p" in url:
-                continue
-            if info.get("network_type") != "normal":
-                continue
-            http_info = info.get("http") or {}
-            if http_info.get("status_code") != 200 or http_info.get("error"):
-                continue
-            search = (info.get("timing") or {}).get("search") or {}
-            ok = search.get("success_percentage")
-            if isinstance(ok, (int, float)) and ok < 90:
-                continue
-            median = (search.get("all") or {}).get("median")
-            ranked.append((float(median) if isinstance(median, (int, float)) else 9.9, url.rstrip("/")))
-        except (AttributeError, TypeError, ValueError):
-            continue
-    ranked.sort()
-    return [u for _, u in ranked[:12]]
-
-
-@st.cache_resource
-def _instance_cooldowns() -> dict[str, float]:
-    """Instances that recently failed -> time (epoch) until which we skip them."""
-    return {}
-
-
-def get_instances() -> list[str]:
-    override = searxng_override()
-    if override:
-        return [override]
-    try:
-        found = discover_instances()
-    except Exception:
-        found = []
-    ordered = list(found) + [u for u in SEARX_SEED_INSTANCES if u not in found]
-    return ordered
-
-
-# --- SearXNG search ----------------------------------------------------------
-def parse_searx_html(page_html: str) -> list[dict]:
-    """Parse the default SearXNG HTML results page (fallback when JSON is disabled)."""
-    parts = _ARTICLE_SPLIT.split(page_html)
-    if len(parts) <= 1:
-        parts = _RESULT_DIV_SPLIT.split(page_html)
-    results = []
-    for block in parts[1:]:
-        lm = _H3_LINK_RE.search(block)
-        if not lm:
-            continue
-        href = _attr(lm.group(1), "href")
-        if not href:
-            continue
-        url = html.unescape(href).strip()
-        if not url.startswith("http"):
-            continue
-        cm = _CONTENT_RE.search(block)
-        results.append({"url": url, "title": _strip_html(lm.group(2)), "snippet": _strip_html(cm.group(1)) if cm else ""})
-    return results
-
-
-def _searx_fetch_page(base: str, query: str, page: int) -> list[dict]:
-    """One results page from one instance: JSON first, then HTML. Raises _InstanceFailure."""
-    params = {"q": query, "pageno": page, "language": "en-US", "safesearch": 0, "categories": "general"}
-    endpoint = f"{base}/search"
-
-    try:
-        resp = requests.get(endpoint, params={**params, "format": "json"}, headers=_JSON_HEADERS, timeout=REQUEST_TIMEOUT)
-    except requests.exceptions.RequestException as e:
-        raise _InstanceFailure(str(e)) from e
-    if resp.status_code == 429:
-        raise _InstanceFailure("HTTP 429", blocked=True)
-    if resp.status_code == 200:
-        try:
-            data = resp.json()
-        except ValueError:
-            data = None
-        if isinstance(data, dict) and isinstance(data.get("results"), list):
-            results = [
-                {"url": it["url"], "title": _strip_html(it.get("title", "")), "snippet": _strip_html(it.get("content", ""))}
-                for it in data["results"]
-                if isinstance(it, dict) and str(it.get("url", "")).startswith("http")
-            ]
-            if not results and page == 1 and data.get("unresponsive_engines"):
-                raise _InstanceFailure("search engines unresponsive")
-            return results
-
-    # JSON disabled (typically HTTP 403) or not JSON: read the HTML page instead.
-    try:
-        resp = requests.get(endpoint, params=params, headers=_HTML_HEADERS, timeout=REQUEST_TIMEOUT)
-    except requests.exceptions.RequestException as e:
-        raise _InstanceFailure(str(e)) from e
-    if resp.status_code in (403, 429):
-        raise _InstanceFailure(f"HTTP {resp.status_code}", blocked=True)
-    if resp.status_code != 200:
-        raise _InstanceFailure(f"HTTP {resp.status_code}")
-    results = parse_searx_html(resp.text)
-    if not results and page == 1:
-        raise _InstanceFailure("no parsable results")
-    return results
-
-
-def _run_query(query: str, instances: list[str], cooldowns: dict, start: int, deadline: float) -> tuple[list[dict], list[tuple[bool, str]]]:
-    """Fetch up to MAX_PAGES_PER_QUERY pages for one query, failing over between instances."""
-    out: list[dict] = []
-    failures: list[tuple[bool, str]] = []
-    n = len(instances)
-    cursor = start
-    for page in range(1, MAX_PAGES_PER_QUERY + 1):
-        page_results = None
-        tries = 0
-        for k in range(n):
-            if tries >= MAX_INSTANCE_TRIES or time.monotonic() > deadline:
-                break
-            idx = (cursor + k) % n
-            base = instances[idx]
-            if cooldowns.get(base, 0) > time.time():
-                continue
-            tries += 1
-            try:
-                page_results = _searx_fetch_page(base, query, page)
-                cursor = idx  # stick with the instance that worked
-                break
-            except _InstanceFailure as e:
-                cooldowns[base] = time.time() + INSTANCE_COOLDOWN_S
-                failures.append((e.blocked, f"{urlparse(base).hostname}: {e}"))
-        if not page_results:
-            break
-        out.extend(page_results)
-    return out, failures
-
-
-def _search_queries(keyword: str, location: str) -> list[str]:
-    return [
-        f"{keyword} in {location}",
-        f"{keyword} {location} phone address",
-        f"{keyword} {location} owner OR founder OR CEO",
-    ]
-
-
-# --- lead extraction ---------------------------------------------------------
-def website_root(url: str) -> str:
-    p = urlparse(url)
-    return f"{p.scheme or 'https'}://{(p.hostname or '').lower()}"
-
-
-def _is_business_page(url: str, host: str) -> bool:
-    """For social/directory hosts keep single-business pages, drop posts, groups and search pages."""
-    path = urlparse(url).path.lower().strip("/")
-    segs = [s for s in path.split("/") if s]
-    if host.endswith("yelp.com"):
-        return path.startswith("biz/")
-    if host.endswith("yellowpages.com"):
-        return "/mip/" in f"/{path}/"
-    if host.endswith("bbb.org"):
-        return "/profile/" in f"/{path}/"
-    if host.endswith("facebook.com") or host.endswith("fb.com"):
-        if not segs:
-            return False
-        bad = {"groups", "events", "watch", "marketplace", "public", "hashtag", "posts", "photo", "photos", "reel", "share", "story.php", "login", "help"}
-        if segs[0] in bad or "posts" in segs or "videos" in segs or "photos" in segs:
-            return False
-        return True
-    if host.endswith("instagram.com"):
-        return len(segs) == 1 and segs[0] not in {"explore", "p", "reel", "reels", "tv", "stories"}
-    if host.endswith("linkedin.com"):
-        return bool(segs) and segs[0] == "company"
-    if _host_matches(host, ("twitter.com", "x.com", "tiktok.com", "youtube.com", "linktr.ee", "wa.me")):
-        return len(segs) == 1
-    return True  # business.site, sites.google.com and generic directories: rely on the title filter
-
-
-def clean_business_name(title: str, host: str, location: str) -> str | None:
-    title = re.sub(r"\(@[^)]*\)", " ", title)
-    title = re.sub(r"\s+", " ", title).strip()
-    loc_norm = _norm(location)
-    segments: list[str] = []
-    for seg in _TITLE_SEP_RE.split(title):
-        seg = seg.strip(" ,.-–—|")
-        low = seg.lower()
-        if not seg or low in _GENERIC_SEGMENTS or any(low == lbl or low.startswith(lbl + " ") and len(low) < 22 for lbl in _SITE_LABELS):
-            continue
-        seg_norm = _norm(seg)
-        if loc_norm and seg_norm and len(seg_norm) <= len(loc_norm) + 8 and (loc_norm in seg_norm or seg_norm in loc_norm):
-            continue  # a bare "Houston, TX" style segment
-        if re.fullmatch(r"[A-Za-z .'\-]+,\s*[A-Z]{2}(\s+\d{5})?", seg):
-            continue
-        segments.append(seg)
-    if not segments:
-        return None
-
-    core = _norm(host.split(".")[0]) if host else ""
-    if core and not _host_matches(host, SOCIAL_DOMAINS + DIRECTORY_DOMAINS):
-        for seg in segments:
-            sn = _norm(seg)
-            if len(sn) >= 4 and (sn in core or core in sn):
-                return seg[:80]
-    return segments[0][:80]
-
-
-def _first_phone(text: str) -> str | None:
-    for m in _PHONE_RE.finditer(text):
-        raw = m.group(0).strip()
-        digits = re.sub(r"\D", "", raw)
-        if 10 <= len(digits) <= 13 and not re.fullmatch(r"(19|20)\d{2}\D?(19|20)\d{2}", raw):
-            return raw
-    return None
-
-
-def _first_address(text: str) -> str | None:
-    m = _ADDRESS_RE.search(text)
-    return re.sub(r"\s+", " ", m.group(0)).strip(" ,") if m else None
-
-
-def maps_link(name: str, location: str) -> str:
-    return "https://www.google.com/maps/search/?api=1&query=" + quote_plus(f"{name} {location}")
-
-
-def result_to_lead(r: dict, keyword: str, location: str) -> dict | None:
-    url, title, snippet = r["url"], r["title"], r["snippet"]
-    host = website_host(url)
-    if not host or _host_matches(host, NOISE_DOMAINS):
-        return None
-    if _LISTICLE_RE.search(title):
-        return None
-
-    is_social = is_social_host(url)
-    is_directory = _host_matches(host, DIRECTORY_DOMAINS)
-    if (is_social or is_directory) and not _is_business_page(url, host):
-        return None
-
-    name = clean_business_name(title, host, location)
-    if not name or len(_norm(name)) < 2:
-        return None
-
-    text = f"{title}. {snippet}"
-    if is_social:
-        website, kind = url.split("#")[0], "social"
-    elif is_directory:
-        website, kind = None, "directory"
+def build_overpass_query(keyword: str, scope: dict, limit: int) -> str:
+    selectors = tag_selectors(keyword)
+    if not selectors:
+        raise ValueError("Empty keyword")
+    if scope["kind"] == "area":
+        header = f"area(id:{int(scope['id'])})->.searchArea;\n"
+        suffix = "(area.searchArea)"
     else:
-        website, kind = website_root(url), "own"
-
-    return {
-        "_kind": kind,
-        "_host": host,
-        "Company Name": name,
-        "Decision Maker": None,
-        "Category": keyword.strip().title() or None,
-        "Website": website,
-        "Phone Number": _first_phone(text),
-        "Email": None,
-        "Physical Address": _first_address(snippet),
-        "Map": maps_link(name, location),
-    }
+        south, west, north, east = scope["bbox"]
+        header = ""
+        suffix = f"({south:.6f},{west:.6f},{north:.6f},{east:.6f})"
+    body = "\n".join(f"  nwr{sel}{suffix};" for sel in selectors)
+    return f"[out:json][timeout:45];\n{header}(\n{body}\n);\nout center tags {int(limit)};"
 
 
-def merge_leads(leads: list[dict]) -> list[dict]:
-    """De-duplicate: one row per business. A real own-website beats a social/directory listing."""
-    by_key: dict[str, dict] = {}
-    order: list[str] = []
-    for lead in leads:
-        key = f"host:{lead['_host']}" if lead["_kind"] == "own" else f"name:{_norm(lead['Company Name'])}"
-        name_key = f"name:{_norm(lead['Company Name'])}"
-        existing = by_key.get(key) or by_key.get(name_key)
-        if existing is None:
-            by_key[key] = lead
-            by_key.setdefault(name_key, lead)
-            order.append(key)
-            continue
-        if lead["_kind"] == "own" and existing["_kind"] != "own":
-            for col in ("Phone Number", "Email", "Physical Address"):
-                lead[col] = lead[col] or existing[col]
-            existing.clear()
-            existing.update(lead)
-            by_key[key] = existing
-        else:
-            for col in ("Phone Number", "Email", "Physical Address"):
-                existing[col] = existing[col] or lead[col]
-            if existing["Website"] is None and lead["Website"]:
-                existing["Website"], existing["_kind"] = lead["Website"], lead["_kind"]
-    seen, out = set(), []
-    for key in order:
-        lead = by_key[key]
-        if id(lead) not in seen:
-            seen.add(id(lead))
-            out.append(lead)
-    return out
-
-
-# --- Decision Maker (regex over public search snippets) -----------------------
-def _valid_person(name: str, banned: set[str]) -> bool:
-    tokens = [t for t in re.findall(r"[A-Za-z'\-]+", name) if t.lower() != "dr"]
-    if len(tokens) < 2:
-        return False
-    for t in tokens:
-        low = t.lower().strip("'-")
-        if low in _NAME_STOPWORDS or low in banned:
-            return False
-    return True
-
-
-def extract_decision_maker(texts: list[str], banned: set[str]) -> str | None:
-    """First 'Name (Role)' found in the texts, matching CEO / Founder / Owner style patterns."""
-    for text in texts:
-        found = []
-        for pattern in _DM_PATTERNS:
-            for m in pattern.finditer(text):
-                found.append((m.start(), m.group("name").strip(), m.group("role")))
-        for _, name, role in sorted(found):
-            if _valid_person(name, banned):
-                label = _ROLE_LABELS.get(re.sub(r"[^a-z]", "", role.lower()), role.title())
-                return f"{name} ({label})"
-    return None
-
-
-def _lead_texts(lead: dict, raw: list[dict]) -> list[str]:
-    """Search-result text that belongs to this business: same domain first, then name mentions."""
-    host, name_norm = lead["_host"], _norm(lead["Company Name"])
-    same_domain, mentions = [], []
-    for r in raw:
-        text = f"{r['title']}. {r['snippet']}"
-        r_host = website_host(r["url"])
-        if lead["_kind"] == "own" and (r_host == host or r_host.endswith("." + host)):
-            same_domain.append(text)
-        elif len(name_norm) >= 6 and name_norm in _norm(text):
-            mentions.append(text)
-    return same_domain + mentions
-
-
-def attach_decision_makers(leads: list[dict], raw: list[dict], keyword: str, location: str) -> None:
-    generic = {w for w in re.findall(r"[a-z]{3,}", f"{keyword} {location}".lower())}
-    for lead in leads:
-        banned = generic | {w for w in re.findall(r"[a-z]{3,}", lead["Company Name"].lower())}
-        banned |= {w for w in re.findall(r"[a-z]{3,}", lead["_host"].split(".")[0])}
-        lead["Decision Maker"] = extract_decision_maker(_lead_texts(lead, raw), banned) or NO_DECISION_MAKER
-
-
-# --- Email finder (strict: email domain must match the website domain) ---------
-def email_matches_site(email: str, site_host: str) -> bool:
-    if "@" not in email:
-        return False
-    email_domain = email.rsplit("@", 1)[1].lower().strip(".")
-    host = site_host.lower().strip(".")
-    host = host[4:] if host.startswith("www.") else host
-    return bool(email_domain) and (
-        email_domain == host or host.endswith("." + email_domain) or email_domain.endswith("." + host)
-    )
-
-
-def pick_site_email(text: str, site_host: str) -> str | None:
-    text = html.unescape(text)
-    candidates = [m.group(1) for m in re.finditer(r"mailto:([^\"'?<>\s]+)", text, re.I)]
-    candidates += _EMAIL_RE.findall(text)
-    for cand in candidates:
-        m = _EMAIL_RE.search(unquote(cand))
-        if not m:
-            continue
-        email = m.group(0).lower()
-        if email.endswith(_IMG_EXT):
-            continue
-        if email_matches_site(email, site_host):
-            return email
-    return None
-
-
-@lru_cache(maxsize=4096)
-def _is_public_host(host: str) -> bool:
-    """SSRF guard: only fetch hosts that resolve exclusively to public internet addresses."""
+def geocode_location(location: str) -> dict:
+    """Resolve a place name to an OSM area id and bounding box using free Nominatim."""
     try:
-        infos = socket.getaddrinfo(host, None)
-    except OSError:
-        return False
-    if not infos:
-        return False
-    for info in infos:
-        try:
-            if not ipaddress.ip_address(info[4][0].split("%")[0]).is_global:
-                return False
-        except ValueError:
-            return False
-    return True
-
-
-def _fetch_html(url: str) -> tuple[str, str] | None:
-    """GET a page (max 3 redirects, each re-checked, 400 KB cap). Returns (final_url, html)."""
-    for _ in range(4):
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            return None
-        if parsed.port not in (None, 80, 443) or not _is_public_host(parsed.hostname):
-            return None
-        try:
-            resp = requests.get(url, headers=_HTML_HEADERS, timeout=(4, 7), allow_redirects=False, stream=True)
-        except requests.exceptions.RequestException:
-            return None
-        try:
-            if resp.status_code in (301, 302, 303, 307, 308):
-                location = resp.headers.get("Location")
-                if not location:
-                    return None
-                url = urljoin(url, location)
-                continue
-            if resp.status_code != 200 or "html" not in resp.headers.get("Content-Type", "html").lower():
-                return None
-            body, size = [], 0
-            for chunk in resp.iter_content(65536):
-                body.append(chunk)
-                size += len(chunk)
-                if size >= PAGE_MAX_BYTES:
-                    break
-            return url, b"".join(body).decode(resp.encoding or "utf-8", errors="replace")
-        except requests.exceptions.RequestException:
-            return None
-        finally:
-            resp.close()
-    return None
-
-
-def _contact_links(page_html: str, base_url: str, site_host: str) -> list[str]:
-    links: list[str] = []
-    for href in _HREF_RE.findall(page_html):
-        if href.lower().startswith(("mailto:", "tel:", "javascript:")):
-            continue
-        absolute = urljoin(base_url, html.unescape(href))
-        p = urlparse(absolute)
-        if not p.hostname or not email_matches_site(f"x@{p.hostname.lower()}", site_host):
-            continue
-        if _CONTACT_PATH_RE.search(p.path) and absolute not in links:
-            links.append(absolute)
-    links.sort(key=lambda u: 0 if "contact" in u.lower() else 1)
-    return links
-
-
-def find_site_email(root_url: str, site_host: str) -> str | None:
-    page = _fetch_html(root_url + "/")
-    if page is None:
-        return None
-    final_url, body = page
-    email = pick_site_email(body, site_host)
-    if email:
-        return email
-    for link in _contact_links(body, final_url, site_host)[:2]:
-        sub = _fetch_html(link)
-        if sub:
-            email = pick_site_email(sub[1], site_host)
-            if email:
-                return email
-    return None
-
-
-def attach_site_emails(leads: list[dict], raw: list[dict]) -> None:
-    """Fill Email for businesses with their own website. Domain match is mandatory."""
-    pending = []
-    for lead in leads:
-        if lead["_kind"] != "own":
-            continue
-        for text in _lead_texts(lead, raw)[:6]:
-            email = pick_site_email(text, lead["_host"])
-            if email:
-                lead["Email"] = email
-                break
-        if not lead["Email"]:
-            pending.append(lead)
-    if not pending:
-        return
-
-    pool = ThreadPoolExecutor(max_workers=EMAIL_WORKERS)
-    futures = {pool.submit(find_site_email, lead["Website"], lead["_host"]): lead for lead in pending}
+        resp = requests.get(
+            NOMINATIM_URL,
+            params={"q": location, "format": "jsonv2", "limit": 5},
+            headers=HTTP_HEADERS,
+            timeout=20,
+        )
+    except requests.exceptions.RequestException as e:
+        raise GeocodeError(str(e)) from e
+    if resp.status_code != 200:
+        raise GeocodeError(f"Nominatim returned HTTP {resp.status_code}")
     try:
-        for fut in as_completed(futures, timeout=EMAIL_BUDGET_S):
+        results = resp.json()
+    except ValueError as e:
+        raise GeocodeError("Nominatim returned an unreadable response") from e
+    if not results:
+        raise LocationNotFound(location)
+
+    ranked = sorted(results, key=lambda r: {"relation": 0, "way": 1}.get(r.get("osm_type"), 2))
+    best = ranked[0]
+
+    bbox = None
+    raw_bb = best.get("boundingbox")
+    if raw_bb and len(raw_bb) == 4:
+        south, north, west, east = (float(x) for x in raw_bb)
+        bbox = (south, west, north, east)
+
+    area_id = None
+    if best.get("osm_type") == "relation":
+        area_id = 3600000000 + int(best["osm_id"])
+    elif best.get("osm_type") == "way":
+        area_id = 2400000000 + int(best["osm_id"])
+
+    if area_id is None and bbox is None:
+        raise LocationNotFound(location)
+
+    display = ", ".join(p.strip() for p in str(best.get("display_name", location)).split(",")[:2])
+    return {"name": display or location, "area_id": area_id, "bbox": bbox}
+
+
+def run_overpass(query: str) -> list[dict]:
+    """POST the query to public Overpass servers with retry and failover."""
+    errors: list[str] = []
+    for url in OVERPASS_ENDPOINTS:
+        host = urlparse(url).hostname
+        for attempt in range(2):
             try:
-                futures[fut]["Email"] = fut.result()
-            except Exception:
-                pass
-    except FuturesTimeout:
-        pass  # leave the rest without an email rather than keep the user waiting
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+                resp = requests.post(url, data={"data": query}, headers=HTTP_HEADERS, timeout=(10, 60))
+            except requests.exceptions.Timeout:
+                errors.append(f"{host}: timed out")
+                break
+            except requests.exceptions.RequestException as e:
+                errors.append(f"{host}: {e}")
+                break
+
+            if resp.status_code == 200:
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    errors.append(f"{host}: unreadable data")
+                    break
+                elements = payload.get("elements", [])
+                remark = str(payload.get("remark", ""))
+                if "runtime error" in remark and not elements:
+                    errors.append(f"{host}: query too heavy ({remark[:80]})")
+                    break
+                return elements
+
+            if resp.status_code in (429, 502, 503, 504):
+                errors.append(f"{host}: busy (HTTP {resp.status_code})")
+                time.sleep(2 * (attempt + 1))
+                continue
+
+            errors.append(f"{host}: HTTP {resp.status_code}")
+            break
+    raise OverpassError(" | ".join(errors) or "unknown error")
 
 
-def leads_to_frame(leads: list[dict]) -> pd.DataFrame:
-    if not leads:
-        return pd.DataFrame(columns=COLUMNS)
-    df = pd.DataFrame([{c: lead.get(c) for c in COLUMNS} for lead in leads], columns=COLUMNS)
-    df["Decision Maker"] = df["Decision Maker"].fillna(NO_DECISION_MAKER)
-    return df.astype(object).where(df.notna(), None).reset_index(drop=True)
-
-
-# --- OpenStreetMap-based prototype search -----------------------------------
-# This is a no-API-key prototype for validating the workflow, not a complete
-# commercial lead database. Coverage depends on OpenStreetMap contributors.
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OVERPASS_ENDPOINTS = [
-    "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
-    "https://overpass.private.coffee/api/interpreter",
-]
-OSM_USER_AGENT = "B2BProspectsPrototype/0.1 (+https://b2bprospects.io)"
-
-INDUSTRY_TAGS = {
-    "plumber": [('craft', 'plumber')],
-    "plumbers": [('craft', 'plumber')],
-    "plumbing": [('craft', 'plumber')],
-    "roofer": [('craft', 'roofer')],
-    "roofers": [('craft', 'roofer')],
-    "roofing": [('craft', 'roofer')],
-    "dentist": [('healthcare', 'dentist')],
-    "dentists": [('healthcare', 'dentist')],
-    "restaurant": [('amenity', 'restaurant')],
-    "restaurants": [('amenity', 'restaurant')],
-    "cafe": [('amenity', 'cafe')],
-    "cafes": [('amenity', 'cafe')],
-    "realtor": [('office', 'estate_agent')],
-    "realtors": [('office', 'estate_agent')],
-    "real estate": [('office', 'estate_agent')],
-    "lawyer": [('office', 'lawyer')],
-    "lawyers": [('office', 'lawyer')],
-    "attorney": [('office', 'lawyer')],
-    "attorneys": [('office', 'lawyer')],
-    "electrician": [('craft', 'electrician')],
-    "electricians": [('craft', 'electrician')],
-    "accountant": [('office', 'accountant')],
-    "accountants": [('office', 'accountant')],
-    "doctor": [('healthcare', 'doctor')],
-    "doctors": [('healthcare', 'doctor')],
-    "veterinarian": [('amenity', 'veterinary')],
-    "veterinarians": [('amenity', 'veterinary')],
-    "auto repair": [('shop', 'car_repair')],
-    "car repair": [('shop', 'car_repair')],
-    "hair salon": [('shop', 'hairdresser')],
-    "salon": [('shop', 'hairdresser')],
-    "hotels": [('tourism', 'hotel')],
-    "hotel": [('tourism', 'hotel')],
-}
-
-
-def industry_selectors(keyword: str) -> list[str] | None:
-    """Return OSM selectors for common industries; None means name-match fallback."""
-    pairs = INDUSTRY_TAGS.get(sanitize_term(keyword))
-    if not pairs:
-        return None
-    return [f' nwr(around:25000,{{lat}},{{lon}})["{key}"="{value}"]["name"];'
-            for key, value in pairs]
-
-
-def _osm_text(tags: dict, *keys: str) -> str | None:
+def _first_value(tags: dict, keys: tuple[str, ...]) -> str | None:
     for key in keys:
         value = tags.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            return value.split(";")[0].strip()
     return None
 
 
-def _osm_address(tags: dict) -> str | None:
-    parts = []
-    street = " ".join(x for x in [tags.get("addr:housenumber"), tags.get("addr:street")] if x)
-    if street:
-        parts.append(street)
-    for key in ("addr:unit", "addr:city", "addr:state", "addr:postcode", "addr:country"):
-        if tags.get(key):
-            parts.append(str(tags[key]).strip())
-    return ", ".join(parts) or None
+def clean_website(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    url = raw.strip()
+    if not url:
+        return None
+    if "://" not in url:
+        url = "https://" + url
+    return url
 
 
-def _osm_category(tags: dict, fallback: str) -> str:
-    for key in ("craft", "office", "shop", "amenity", "healthcare", "tourism", "leisure", "industrial"):
-        if tags.get(key):
-            return str(tags[key]).replace("_", " ").title()
-    return fallback.strip().title()
+def build_address(tags: dict) -> str | None:
+    full = tags.get("addr:full")
+    if isinstance(full, str) and full.strip():
+        return full.strip()
+    street = " ".join(p.strip() for p in (tags.get("addr:housenumber"), tags.get("addr:street")) if p and p.strip())
+    city = (tags.get("addr:city") or tags.get("addr:suburb") or tags.get("addr:town") or "").strip()
+    region = " ".join(p.strip() for p in (tags.get("addr:state"), tags.get("addr:postcode")) if p and p.strip())
+    parts = [p for p in (street, city, region) if p]
+    return ", ".join(parts) if parts else None
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def geocode_location(location: str) -> tuple[float, float, str] | None:
-    """Geocode one user-supplied place; cached to reduce requests to Nominatim."""
-    try:
-        response = requests.get(
-            NOMINATIM_URL,
-            params={"q": location, "format": "jsonv2", "limit": 1},
-            headers={"User-Agent": OSM_USER_AGENT, "Accept-Language": "en"},
-            timeout=(5, 12),
+def category_label(tags: dict) -> str | None:
+    for key in CATEGORY_KEYS:
+        value = tags.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.replace("_", " ").title()
+    return None
+
+
+def parse_elements(elements: list[dict]) -> pd.DataFrame:
+    rows = []
+    for el in elements:
+        tags = el.get("tags") or {}
+        name = tags.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        email = _first_value(tags, ("email", "contact:email"))
+        if email:
+            email = email.replace("mailto:", "").strip().lower()
+        el_type, el_id = el.get("type"), el.get("id")
+        rows.append(
+            {
+                "Company Name": name.strip(),
+                "Category": category_label(tags),
+                "Website": clean_website(_first_value(tags, ("website", "contact:website", "url", "contact:url"))),
+                "Phone Number": _first_value(tags, ("phone", "contact:phone", "mobile", "contact:mobile")),
+                "Email": email or None,
+                "Physical Address": build_address(tags),
+                "Map": f"https://www.openstreetmap.org/{el_type}/{el_id}" if el_type and el_id else None,
+            }
         )
-        if response.status_code == 429:
-            raise SearchBlocked("Nominatim rate limit (HTTP 429)")
-        response.raise_for_status()
-        results = response.json()
-        if not results:
-            return None
-        item = results[0]
-        return float(item["lat"]), float(item["lon"]), str(item.get("display_name") or location)
-    except SearchBlocked:
-        raise
-    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
-        raise SearchUnavailable(f"Location lookup failed: {exc}") from exc
-
-
-def _overpass_query(keyword: str, lat: float, lon: float, search_mode: str, max_results: int) -> str:
-    radius = 25000
-    if search_mode == "Company name":
-        term = sanitize_term(keyword)
-        if not term:
-            raise ValueError("Enter a company name using letters or numbers.")
-        # sanitize_term removes regex punctuation, so the remaining phrase is safe to use here.
-        regex = term
-        selectors = [f' nwr(around:{radius},{lat},{lon})["name"~"{regex}",i];']
-    else:
-        selectors = industry_selectors(keyword)
-        if selectors:
-            selectors = [sel.format(lat=lat, lon=lon).replace('around:25000', f'around:{radius}') for sel in selectors]
-        else:
-            term = sanitize_term(keyword)
-            if not term:
-                raise ValueError("Enter an industry or business type using letters or numbers.")
-            regex = term
-            selectors = [f' nwr(around:{radius},{lat},{lon})["name"~"{regex}",i];']
-    limit = max(1, min(int(max_results), 100))
-    return "[out:json][timeout:25];(\n" + "\n".join(selectors) + f"\n);out center tags {limit};"
-
-
-def _osm_elements_to_leads(elements: list[dict], keyword: str, location: str) -> list[dict]:
-    leads, seen = [], set()
-    for element in elements:
-        tags = element.get("tags") or {}
-        name = _osm_text(tags, "name", "brand", "operator")
-        if not name:
-            continue
-        website = _osm_text(tags, "contact:website", "website", "url")
-        if website and not website.lower().startswith(("http://", "https://")):
-            website = "https://" + website
-        phone = _osm_text(tags, "contact:phone", "phone", "mobile")
-        email = _osm_text(tags, "contact:email", "email")
-        if email and not _EMAIL_RE.fullmatch(email.strip()):
-            email = None
-        if phone:
-            phone = phone[:80]
-        key = (_norm(name), (website or "").lower(), (phone or "").lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        obj_type = str(element.get("type") or "node")
-        obj_id = element.get("id")
-        source = f"https://www.openstreetmap.org/{obj_type}/{obj_id}" if obj_id else "https://www.openstreetmap.org/"
-        leads.append({
-            "Company Name": name[:120],
-            "Decision Maker": NO_DECISION_MAKER,
-            "Category": _osm_category(tags, keyword),
-            "Website": website,
-            "Phone Number": phone,
-            "Email": email,
-            "Physical Address": _osm_address(tags),
-            "Map": maps_link(name, location),
-            "Source": source,
-        })
-    return leads
+    columns = ["Company Name", "Category", "Website", "Phone Number", "Email", "Physical Address", "Map"]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    df = pd.DataFrame(rows, columns=columns)
+    return df.sort_values("Company Name", key=lambda s: s.str.lower()).reset_index(drop=True)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_leads(keyword: str, location: str, max_results: int, search_mode: str = "Industry + location") -> tuple[pd.DataFrame, str]:
-    """Small no-key prototype using OpenStreetMap's public geocoding/search services."""
-    place = geocode_location(location)
-    if not place:
-        raise SearchUnavailable(f"Could not find the location '{location}'. Try a city and region, e.g. Houston, Texas.")
-    lat, lon, place_name = place
-    query = _overpass_query(keyword, lat, lon, search_mode, max_results)
-    # Fail over between public Overpass instances if one is temporarily unhealthy.
-    # Keep retries limited: these are shared community services, not a bulk-data API.
-    last_error = "unknown error"
-    payload = None
-    headers = {"User-Agent": OSM_USER_AGENT, "Accept": "application/json"}
-    for endpoint in OVERPASS_ENDPOINTS:
-        for attempt in range(2):
-            try:
-                response = requests.post(
-                    endpoint,
-                    data={"data": query},
-                    headers=headers,
-                    timeout=(5, 45),
-                )
-            except requests.exceptions.Timeout:
-                last_error = f"{endpoint} timed out"
-                break
-            except requests.exceptions.RequestException as exc:
-                last_error = f"{endpoint}: {exc}"
-                break
+def fetch_leads(keyword: str, location: str, max_results: int) -> tuple[pd.DataFrame, str]:
+    geo = geocode_location(location)
 
-            if response.status_code == 200:
-                try:
-                    candidate = response.json()
-                except ValueError:
-                    last_error = f"{endpoint} returned unreadable data"
-                    break
-                if not isinstance(candidate, dict):
-                    last_error = f"{endpoint} returned an unexpected response"
-                    break
-                remark = str(candidate.get("remark", ""))
-                if "runtime error" in remark.lower() and not candidate.get("elements"):
-                    last_error = f"{endpoint}: {remark}"
-                    break
-                payload = candidate
-                break
+    scopes = []
+    if geo["area_id"]:
+        scopes.append({"kind": "area", "id": geo["area_id"]})
+    if geo["bbox"]:
+        scopes.append({"kind": "bbox", "bbox": geo["bbox"]})
 
-            if response.status_code == 429:
-                # Respect explicit rate limits; don't keep querying other public servers.
-                raise SearchBlocked(f"OpenStreetMap Overpass rate limit (HTTP 429) at {endpoint}")
-            if response.status_code in (502, 503, 504):
-                last_error = f"{endpoint} is temporarily busy (HTTP {response.status_code})"
-                if attempt == 0:
-                    time.sleep(2)
-                    continue
-                break
-            last_error = f"{endpoint} returned HTTP {response.status_code}"
+    elements: list[dict] = []
+    for scope in scopes:
+        elements = run_overpass(build_overpass_query(keyword, scope, max_results))
+        if elements:
             break
-        if payload is not None:
-            break
-
-    if payload is None:
-        raise SearchUnavailable(f"OpenStreetMap query failed after trying available Overpass servers: {last_error}")
-    elements = payload.get("elements", [])
-    leads = _osm_elements_to_leads(elements, keyword, location)
-    leads = leads[:max(1, min(int(max_results), 100))]
-    return leads_to_frame(leads), place_name
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_leads_legacy(keyword: str, location: str, max_results: int) -> tuple[pd.DataFrame, str]:
-    """Legacy SearXNG implementation retained for reference; not used by the prototype UI."""
-    instances = get_instances()
-    cooldowns = _instance_cooldowns()
-    queries = _search_queries(keyword, location)
-    deadline = time.monotonic() + SEARCH_BUDGET_S
-    raw: list[dict] = []
-    failures: list[tuple[bool, str]] = []
-    for i, query in enumerate(queries):
-        if time.monotonic() >= deadline:
-            break
-        results, fails = _run_query(query, instances, cooldowns, i, deadline)
-        raw.extend(results)
-        failures.extend(fails)
-    seen_urls: set[str] = set()
-    unique_raw = []
-    for r in raw:
-        if r["url"] not in seen_urls:
-            seen_urls.add(r["url"])
-            unique_raw.append(r)
-    if not unique_raw:
-        if failures:
-            if any(blocked for blocked, _ in failures):
-                raise SearchBlocked(failures[-1][1])
-            raise SearchUnavailable(failures[-1][1])
-        return leads_to_frame([]), location
-    leads = [l for l in (result_to_lead(r, keyword, location) for r in unique_raw) if l]
-    merged = merge_leads(leads)[: int(max_results)]
-    attach_decision_makers(merged, unique_raw, keyword, location)
-    attach_site_emails(merged, unique_raw)
-    return leads_to_frame(merged), location
+    return parse_elements(elements), geo["name"]
 
 
 # ----------------------------------------------------------------------------
@@ -1327,7 +681,8 @@ def section_header(eyebrow: str, title: str, sub: str = "") -> None:
 def render_footer() -> None:
     st.markdown(
         '<div class="foot">© 2026 <a href="https://b2bprospects.io" target="_blank">B2BProspects.io</a><br>'
-        'Data © <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap contributors</a> · ODbL</div>' ,
+        'Business data © <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap contributors</a>'
+        " (ODbL) · Served via the Overpass API</div>",
         unsafe_allow_html=True,
     )
 
@@ -1335,7 +690,7 @@ def render_footer() -> None:
 # ----------------------------------------------------------------------------
 # STATE
 # ----------------------------------------------------------------------------
-st.session_state.setdefault("unlocked", True)
+st.session_state.setdefault("unlocked", False)
 st.session_state.setdefault("leads", None)
 st.session_state.setdefault("meta", "")
 
@@ -1346,26 +701,26 @@ inject_css(hide_grid_toolbar=not st.session_state["unlocked"])
 # ----------------------------------------------------------------------------
 with st.sidebar:
     st.markdown(
-        '<div class="brand"><div>'
-        """<div><img src="app/static/logo.png" width="38" style="vertical-align:middle; border-radius:8px; margin-right:8px;"> <span class='brand-name' style='font-weight:800; font-size:1.1rem; color:#1e1b4b;'>B2B<span style='color:#5b2fd6;'>Prospects</span></span></div>"""
+        '<div class="brand"><div class="brand-mark">🎯</div><div>'
+        '<div class="brand-name">B2B<span>Prospects</span></div>'
         '<div class="brand-sub">Elite Prospecting Portal</div></div></div>',
         unsafe_allow_html=True,
     )
     st.divider()
     st.markdown(
-        '<div class="badge-ok">✅ Data Source: OpenStreetMap</div>',
+        '<div class="badge-ok">✅ OpenStreetMap Data Pipeline Active (No Billing Required)</div>',
         unsafe_allow_html=True,
     )
     st.write("")
     max_results = st.select_slider(
         "Max results per search",
-        options=[10, 25, 50, 100],
-        value=25,
-        help="The free public data source is best used for small, exploratory searches.",
+        options=[25, 50, 100, 200, 300],
+        value=100,
+        help="Larger searches take longer on the free public OpenStreetMap servers.",
     )
     st.markdown(
-        '<div class="tip"><b>Prototype · no API key.</b> Results come from OpenStreetMap, not a complete company database. '
-        "Coverage varies by place. Only publicly mapped contact fields are shown. "
+        '<div class="tip"><b>No API key needed.</b> Data comes from OpenStreetMap, which is community maintained. '
+        "Coverage varies by city, and some businesses have no website or phone listed. "
         "City-level locations such as <b>Houston, Texas</b> work best.</div>",
         unsafe_allow_html=True,
     )
@@ -1378,10 +733,10 @@ with st.sidebar:
 # ----------------------------------------------------------------------------
 st.markdown(
     '<div class="hero">'
-    '<span class="hero-badge"><i></i>Live Search Intelligence</span>'
+    '<span class="hero-badge"><i></i>Free OpenStreetMap Intelligence</span>'
     '<h1>🎯 B2B<span class="grad">Prospects.io</span><span class="sep">|</span>Elite Prospecting Portal</h1>'
-    "<p>Find public business listings by company name or industry, review the available contact details, "
-    "and export a prospect list with source links.</p>"
+    "<p>Surface local businesses that are ready to buy. Find companies with no website, a social-media-only "
+    "presence or incomplete listings, then turn them into agency clients.</p>"
     "</div>",
     unsafe_allow_html=True,
 )
@@ -1390,14 +745,10 @@ st.markdown(
 # SEARCH DASHBOARD
 # ----------------------------------------------------------------------------
 with st.container(key="card_search"):
-    section_header("Step 1", "Search Dashboard", "Search a company name or look up a supported business category in a city or region.")
-    search_mode = st.radio("Search type", ["Industry + location", "Company name"], horizontal=True, key="search_mode")
+    section_header("Step 1", "Search Dashboard", "Pick a niche and a market. We pull live data from OpenStreetMap.")
     c1, c2, c3 = st.columns([3, 3, 1.5], vertical_alignment="bottom")
-    if search_mode == "Company name":
-        keyword = c1.text_input("Company Name", placeholder="e.g. Acme Roofing")
-    else:
-        keyword = c1.text_input("Industry / Business Type", placeholder="e.g. plumbers, dentists, roofing")
-    location = c2.text_input("City / Region", placeholder="e.g. Houston, Texas")
+    keyword = c1.text_input("Target Industry / Keyword", placeholder="e.g. plumbers, dentists, roofing")
+    location = c2.text_input("Target Location", placeholder="e.g. Houston, Texas")
     search_clicked = c3.button("🔍 Find Prospects", type="primary", use_container_width=True)
 
 if search_clicked:
@@ -1408,27 +759,26 @@ if search_clicked:
         st.warning("The keyword needs at least one letter or number, for example “plumbers”.")
     else:
         try:
-            with st.spinner("Searching public listings..."):
-                df, place_name = fetch_leads(keyword, location, max_results, search_mode)
+            with st.spinner("Searching OpenStreetMap... large cities can take up to a minute."):
+                df, place_name = fetch_leads(keyword, location, max_results)
             if df.empty:
                 st.session_state["leads"] = None
                 st.warning(
-                    f"No matching businesses were found for “{keyword}” near “{location}” in OpenStreetMap. "
-                    "Coverage varies. Try a broader search term or a nearby larger city."
+                    f"No businesses found for “{keyword}” in “{location}”. OpenStreetMap coverage varies, "
+                    "so try a broader keyword (for example “dentist”) or a larger area."
                 )
             else:
                 st.session_state["leads"] = df
                 st.session_state["meta"] = f"{keyword} — {place_name}"
-                if search_mode == "Industry + location" and industry_selectors(keyword) is None:
-                    st.info("This business type is not in the prototype's category map, so results are matched by business name. It may miss relevant companies.")
-                st.info("Data source: OpenStreetMap. This is a community-mapped dataset, so missing websites, emails, phones, and businesses do not mean they do not exist.")
-        except SearchBlocked:
+        except LocationNotFound:
+            st.warning(f"Couldn't find “{location}”. Try a city and state or country, such as “Houston, Texas”.")
+        except GeocodeError as e:
+            st.error(f"🌐 The OpenStreetMap location service is unreachable right now. Please retry shortly. ({e})")
+        except OverpassError as e:
             st.error(
-                "⏳ The public OpenStreetMap service has temporarily limited requests. Please wait before retrying; "
-                "repeated requests may prolong the limit. This prototype is intended for small, occasional tests."
+                "⏳ The free OpenStreetMap servers are busy or the search timed out. Wait a minute and retry, "
+                f"or use a smaller area or fewer results. ({e})"
             )
-        except SearchUnavailable as e:
-            st.error(f"🌐 The public data service could not complete this search. Please retry later. ({e})")
         except Exception as e:
             st.error(f"Unexpected error: {e}")
 
@@ -1439,7 +789,7 @@ leads: pd.DataFrame | None = st.session_state["leads"]
 
 if leads is None:
     with st.container(key="card_empty"):
-        section_header("Getting started", "Try a small business search", "This prototype searches public OpenStreetMap records. Results vary by location and category.")
+        section_header("Getting started", "Your prospect pipeline is empty", "Three quick steps to your first list of agency-ready leads.")
         st.markdown(
             '<div class="steps">'
             '<div class="step"><div class="step-n">1</div><div class="step-t">Choose your niche</div>'
@@ -1473,13 +823,13 @@ def pct(n: int) -> str:
 st.markdown(
     f'<div class="status"><span><span class="dot"></span><b>{total}</b> prospects loaded for '
     f'<b>{esc(st.session_state["meta"])}</b></span>'
-    f'<span class="src">Source: public search results · results cached for 60 minutes</span></div>',
+    f'<span class="src">Source: OpenStreetMap via Overpass API · results cached for 60 minutes</span></div>',
     unsafe_allow_html=True,
 )
 
 st.markdown(
     '<div class="mgrid">'
-    + metric_card("📇", "Total Leads Found", str(total), "Named businesses from public search", "#5b2fd6")
+    + metric_card("📇", "Total Leads Found", str(total), "Named businesses from OpenStreetMap", "#5b2fd6")
     + metric_card("💎", "High-Value Leads", str(high_value), f"<b>{pct(high_value)}</b> match 2+ agency criteria", "#8b5cf6")
     + metric_card("⚡", "Quick Wins", str(quick_wins), f"<b>{pct(quick_wins)}</b> have no website and a phone number", "#10b981")
     + metric_card("✉️", "Emails Found", str(with_email), f"<b>{pct(with_email)}</b> list a public email address", "#f59e0b")
@@ -1554,40 +904,66 @@ with st.container(key="card_table"):
                 "Email": st.column_config.TextColumn("Email", width="medium"),
                 "Physical Address": st.column_config.TextColumn("Physical Address", width="large"),
                 "Map": st.column_config.LinkColumn("Map", display_text="View ↗", width="small"),
-                "Source": st.column_config.LinkColumn("OSM Source", display_text="Open source ↗", width="small"),
             },
         )
 
 # ----------------------------------------------------------------------------
-# PROTOTYPE EXPORTS (payments are intentionally not connected in this test build)
+# MONETIZATION PAYWALL
 # ----------------------------------------------------------------------------
-with st.container(key="card_unlocked"):
-    st.markdown(
-        '<div class="wall"><div class="wall-ico" style="background:rgba(16,185,129,.12);'
-        'border-color:rgba(16,185,129,.45)">🧪</div>'
-        '<div><p class="wall-title">Prototype Preview</p>'
-        '<p class="wall-text">Exports are enabled so the sample data can be evaluated. Payments and paid access are not connected in this prototype.</p>'
-        '</div></div>',
-        unsafe_allow_html=True,
-    )
-    if not filtered.empty:
-        slug = re.sub(r"[^a-z0-9]+", "_", st.session_state["meta"].lower()).strip("_") or "leads"
-        d1, d2, _ = st.columns([1.2, 1.2, 4])
-        d1.download_button(
-            "⬇️ Download CSV",
-            data=filtered.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"b2bprospects_{slug}.csv",
-            mime="text/csv",
-            use_container_width=True,
+if st.session_state["unlocked"]:
+    with st.container(key="card_unlocked"):
+        st.markdown(
+            '<div class="wall"><div class="wall-ico" style="background:rgba(16,185,129,.12);'
+            'border-color:rgba(16,185,129,.45)">🔓</div>'
+            '<div><p class="wall-title">Export Unlocked</p>'
+            '<p class="wall-text">Unlimited lifetime downloads are active. Your current filtered view is ready to export.</p>'
+            "</div></div>",
+            unsafe_allow_html=True,
         )
-        xlsx = to_excel_bytes(filtered)
-        if xlsx:
-            d2.download_button(
-                "⬇️ Download Excel",
-                data=xlsx,
-                file_name=f"b2bprospects_{slug}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        if not filtered.empty:
+            slug = re.sub(r"[^a-z0-9]+", "_", st.session_state["meta"].lower()).strip("_") or "leads"
+            d1, d2, _ = st.columns([1.2, 1.2, 4])
+            d1.download_button(
+                "⬇️ Download CSV",
+                data=filtered.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"b2bprospects_{slug}.csv",
+                mime="text/csv",
                 use_container_width=True,
             )
+            xlsx = to_excel_bytes(filtered)
+            if xlsx:
+                d2.download_button(
+                    "⬇️ Download Excel",
+                    data=xlsx,
+                    file_name=f"b2bprospects_{slug}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+else:
+    with st.container(key="card_paywall"):
+        st.markdown(
+            '<div class="wall"><div class="wall-ico">🔒</div><div>'
+            '<p class="wall-title">🔒 CSV/Excel Export is Locked.</p>'
+            '<p class="wall-text">Unlock unlimited lifetime downloads for a one-time fee of <b>$49</b> at '
+            f'<a href="{CHECKOUT_URL}" target="_blank">b2bprospects.io</a></p>'
+            "</div></div>"
+            '<div class="wall-badges"><span>✓ One-time payment</span><span>✓ Lifetime access</span>'
+            "<span>✓ CSV + Excel exports</span></div>",
+            unsafe_allow_html=True,
+        )
+        with st.form("license_form", border=False):
+            k1, k2 = st.columns([3, 1.2], vertical_alignment="bottom")
+            entered = k1.text_input(
+                "Enter License Key to Unlock Download",
+                type="password",
+                placeholder="Paste your license key",
+            )
+            submitted = k2.form_submit_button("🔓 Unlock Download", type="primary", use_container_width=True)
+        if submitted:
+            if hmac.compare_digest(entered.strip().encode(), get_license_key().encode()):
+                st.session_state["unlocked"] = True
+                st.rerun()
+            else:
+                st.error("❌ Invalid license key. Please check it and try again.")
 
 render_footer()
