@@ -1,7 +1,6 @@
 # app.py — B2BProspects.io | Elite Prospecting Portal (search-index edition)
 from __future__ import annotations
 
-import hmac
 import html
 import io
 import ipaddress
@@ -21,9 +20,6 @@ import streamlit as st
 # ----------------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------------
-LICENSE_KEY = "B2BPROSPECTS2026"  # test key; override with st.secrets["LICENSE_KEY"] in prod
-CHECKOUT_URL = "https://b2bprospects.io"
-
 st.set_page_config(
     page_title="B2BProspects.io | Elite Prospecting Portal",
     page_icon="static/favicon.ico",
@@ -31,12 +27,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-
-def get_license_key() -> str:
-    try:
-        return str(st.secrets["LICENSE_KEY"])
-    except Exception:
-        return LICENSE_KEY
 
 
 esc = html.escape
@@ -302,7 +292,7 @@ def inject_css(hide_grid_toolbar: bool) -> None:
 
 
 # ----------------------------------------------------------------------------
-# SEARCH DATA LAYER (public SearXNG instances via requests + regex)
+# LEGACY SEARCH DATA LAYER (SearXNG; retained for reference, not used by the prototype UI)
 # ----------------------------------------------------------------------------
 class SearchBlocked(Exception):
     """Every SearXNG instance tried throttled or refused the request (HTTP 403/429)."""
@@ -372,10 +362,10 @@ _HTML_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-NO_DECISION_MAKER = "Request Contact Key"
+NO_DECISION_MAKER = "Not publicly listed"
 COLUMNS = [
     "Company Name", "Decision Maker", "Category", "Website", "Phone Number", "Email",
-    "Physical Address", "Map",
+    "Physical Address", "Map", "Source",
 ]
 
 # --- regexes ---------------------------------------------------------------
@@ -992,38 +982,225 @@ def leads_to_frame(leads: list[dict]) -> pd.DataFrame:
     return df.astype(object).where(df.notna(), None).reset_index(drop=True)
 
 
+# --- OpenStreetMap-based prototype search -----------------------------------
+# This is a no-API-key prototype for validating the workflow, not a complete
+# commercial lead database. Coverage depends on OpenStreetMap contributors.
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OSM_USER_AGENT = "B2BProspectsPrototype/0.1 (+https://b2bprospects.io)"
+
+INDUSTRY_TAGS = {
+    "plumber": [('craft', 'plumber')],
+    "plumbers": [('craft', 'plumber')],
+    "plumbing": [('craft', 'plumber')],
+    "roofer": [('craft', 'roofer')],
+    "roofers": [('craft', 'roofer')],
+    "roofing": [('craft', 'roofer')],
+    "dentist": [('healthcare', 'dentist')],
+    "dentists": [('healthcare', 'dentist')],
+    "restaurant": [('amenity', 'restaurant')],
+    "restaurants": [('amenity', 'restaurant')],
+    "cafe": [('amenity', 'cafe')],
+    "cafes": [('amenity', 'cafe')],
+    "realtor": [('office', 'estate_agent')],
+    "realtors": [('office', 'estate_agent')],
+    "real estate": [('office', 'estate_agent')],
+    "lawyer": [('office', 'lawyer')],
+    "lawyers": [('office', 'lawyer')],
+    "attorney": [('office', 'lawyer')],
+    "attorneys": [('office', 'lawyer')],
+    "electrician": [('craft', 'electrician')],
+    "electricians": [('craft', 'electrician')],
+    "accountant": [('office', 'accountant')],
+    "accountants": [('office', 'accountant')],
+    "doctor": [('healthcare', 'doctor')],
+    "doctors": [('healthcare', 'doctor')],
+    "veterinarian": [('amenity', 'veterinary')],
+    "veterinarians": [('amenity', 'veterinary')],
+    "auto repair": [('shop', 'car_repair')],
+    "car repair": [('shop', 'car_repair')],
+    "hair salon": [('shop', 'hairdresser')],
+    "salon": [('shop', 'hairdresser')],
+    "hotels": [('tourism', 'hotel')],
+    "hotel": [('tourism', 'hotel')],
+}
+
+
+def industry_selectors(keyword: str) -> list[str] | None:
+    """Return OSM selectors for common industries; None means name-match fallback."""
+    pairs = INDUSTRY_TAGS.get(sanitize_term(keyword))
+    if not pairs:
+        return None
+    return [f' nwr(around:25000,{{lat}},{{lon}})["{key}"="{value}"]["name"];'
+            for key, value in pairs]
+
+
+def _osm_text(tags: dict, *keys: str) -> str | None:
+    for key in keys:
+        value = tags.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _osm_address(tags: dict) -> str | None:
+    parts = []
+    street = " ".join(x for x in [tags.get("addr:housenumber"), tags.get("addr:street")] if x)
+    if street:
+        parts.append(street)
+    for key in ("addr:unit", "addr:city", "addr:state", "addr:postcode", "addr:country"):
+        if tags.get(key):
+            parts.append(str(tags[key]).strip())
+    return ", ".join(parts) or None
+
+
+def _osm_category(tags: dict, fallback: str) -> str:
+    for key in ("craft", "office", "shop", "amenity", "healthcare", "tourism", "leisure", "industrial"):
+        if tags.get(key):
+            return str(tags[key]).replace("_", " ").title()
+    return fallback.strip().title()
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def geocode_location(location: str) -> tuple[float, float, str] | None:
+    """Geocode one user-supplied place; cached to reduce requests to Nominatim."""
+    try:
+        response = requests.get(
+            NOMINATIM_URL,
+            params={"q": location, "format": "jsonv2", "limit": 1},
+            headers={"User-Agent": OSM_USER_AGENT, "Accept-Language": "en"},
+            timeout=(5, 12),
+        )
+        if response.status_code == 429:
+            raise SearchBlocked("Nominatim rate limit (HTTP 429)")
+        response.raise_for_status()
+        results = response.json()
+        if not results:
+            return None
+        item = results[0]
+        return float(item["lat"]), float(item["lon"]), str(item.get("display_name") or location)
+    except SearchBlocked:
+        raise
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        raise SearchUnavailable(f"Location lookup failed: {exc}") from exc
+
+
+def _overpass_query(keyword: str, lat: float, lon: float, search_mode: str, max_results: int) -> str:
+    radius = 25000
+    if search_mode == "Company name":
+        term = sanitize_term(keyword)
+        if not term:
+            raise ValueError("Enter a company name using letters or numbers.")
+        # sanitize_term removes regex punctuation, so the remaining phrase is safe to use here.
+        regex = term
+        selectors = [f' nwr(around:{radius},{lat},{lon})["name"~"{regex}",i];']
+    else:
+        selectors = industry_selectors(keyword)
+        if selectors:
+            selectors = [sel.format(lat=lat, lon=lon).replace('around:25000', f'around:{radius}') for sel in selectors]
+        else:
+            term = sanitize_term(keyword)
+            if not term:
+                raise ValueError("Enter an industry or business type using letters or numbers.")
+            regex = term
+            selectors = [f' nwr(around:{radius},{lat},{lon})["name"~"{regex}",i];']
+    limit = max(1, min(int(max_results), 100))
+    return "[out:json][timeout:25];(\n" + "\n".join(selectors) + f"\n);out center tags {limit};"
+
+
+def _osm_elements_to_leads(elements: list[dict], keyword: str, location: str) -> list[dict]:
+    leads, seen = [], set()
+    for element in elements:
+        tags = element.get("tags") or {}
+        name = _osm_text(tags, "name", "brand", "operator")
+        if not name:
+            continue
+        website = _osm_text(tags, "contact:website", "website", "url")
+        if website and not website.lower().startswith(("http://", "https://")):
+            website = "https://" + website
+        phone = _osm_text(tags, "contact:phone", "phone", "mobile")
+        email = _osm_text(tags, "contact:email", "email")
+        if email and not _EMAIL_RE.fullmatch(email.strip()):
+            email = None
+        if phone:
+            phone = phone[:80]
+        key = (_norm(name), (website or "").lower(), (phone or "").lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        obj_type = str(element.get("type") or "node")
+        obj_id = element.get("id")
+        source = f"https://www.openstreetmap.org/{obj_type}/{obj_id}" if obj_id else "https://www.openstreetmap.org/"
+        leads.append({
+            "Company Name": name[:120],
+            "Decision Maker": NO_DECISION_MAKER,
+            "Category": _osm_category(tags, keyword),
+            "Website": website,
+            "Phone Number": phone,
+            "Email": email,
+            "Physical Address": _osm_address(tags),
+            "Map": maps_link(name, location),
+            "Source": source,
+        })
+    return leads
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_leads(keyword: str, location: str, max_results: int) -> tuple[pd.DataFrame, str]:
+def fetch_leads(keyword: str, location: str, max_results: int, search_mode: str = "Industry + location") -> tuple[pd.DataFrame, str]:
+    """Small no-key prototype using OpenStreetMap's public geocoding/search services."""
+    place = geocode_location(location)
+    if not place:
+        raise SearchUnavailable(f"Could not find the location '{location}'. Try a city and region, e.g. Houston, Texas.")
+    lat, lon, place_name = place
+    query = _overpass_query(keyword, lat, lon, search_mode, max_results)
+    try:
+        response = requests.post(
+            OVERPASS_URL,
+            data={"data": query},
+            headers={"User-Agent": OSM_USER_AGENT, "Accept": "application/json"},
+            timeout=(5, 35),
+        )
+        if response.status_code == 429:
+            raise SearchBlocked("OpenStreetMap Overpass rate limit (HTTP 429)")
+        response.raise_for_status()
+        payload = response.json()
+    except SearchBlocked:
+        raise
+    except (requests.RequestException, ValueError) as exc:
+        raise SearchUnavailable(f"OpenStreetMap query failed: {exc}") from exc
+    elements = payload.get("elements", []) if isinstance(payload, dict) else []
+    leads = _osm_elements_to_leads(elements, keyword, location)
+    leads = leads[:max(1, min(int(max_results), 100))]
+    return leads_to_frame(leads), place_name
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_leads_legacy(keyword: str, location: str, max_results: int) -> tuple[pd.DataFrame, str]:
+    """Legacy SearXNG implementation retained for reference; not used by the prototype UI."""
     instances = get_instances()
     cooldowns = _instance_cooldowns()
     queries = _search_queries(keyword, location)
     deadline = time.monotonic() + SEARCH_BUDGET_S
-
     raw: list[dict] = []
     failures: list[tuple[bool, str]] = []
-    # Public SearXNG instances are shared services and often throttle bursts.
-    # Run searches sequentially so one click does not create parallel request spikes.
     for i, query in enumerate(queries):
         if time.monotonic() >= deadline:
             break
         results, fails = _run_query(query, instances, cooldowns, i, deadline)
         raw.extend(results)
         failures.extend(fails)
-
     seen_urls: set[str] = set()
     unique_raw = []
     for r in raw:
         if r["url"] not in seen_urls:
             seen_urls.add(r["url"])
             unique_raw.append(r)
-
     if not unique_raw:
         if failures:
             if any(blocked for blocked, _ in failures):
                 raise SearchBlocked(failures[-1][1])
             raise SearchUnavailable(failures[-1][1])
         return leads_to_frame([]), location
-
     leads = [l for l in (result_to_lead(r, keyword, location) for r in unique_raw) if l]
     merged = merge_leads(leads)[: int(max_results)]
     attach_decision_makers(merged, unique_raw, keyword, location)
@@ -1108,7 +1285,7 @@ def section_header(eyebrow: str, title: str, sub: str = "") -> None:
 def render_footer() -> None:
     st.markdown(
         '<div class="foot">© 2026 <a href="https://b2bprospects.io" target="_blank">B2BProspects.io</a><br>'
-        "Business data collected from public search results</div>",
+        'Data © <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap contributors</a> · ODbL</div>' ,
         unsafe_allow_html=True,
     )
 
@@ -1116,7 +1293,7 @@ def render_footer() -> None:
 # ----------------------------------------------------------------------------
 # STATE
 # ----------------------------------------------------------------------------
-st.session_state.setdefault("unlocked", False)
+st.session_state.setdefault("unlocked", True)
 st.session_state.setdefault("leads", None)
 st.session_state.setdefault("meta", "")
 
@@ -1134,19 +1311,19 @@ with st.sidebar:
     )
     st.divider()
     st.markdown(
-        '<div class="badge-ok">✅ Data Engine: SearXNG Active</div>',
+        '<div class="badge-ok">✅ Data Source: OpenStreetMap</div>',
         unsafe_allow_html=True,
     )
     st.write("")
     max_results = st.select_slider(
         "Max results per search",
-        options=[25, 50, 100, 200, 300],
-        value=100,
-        help="Larger searches take a little longer because more result pages are fetched.",
+        options=[10, 25, 50, 100],
+        value=25,
+        help="The free public data source is best used for small, exploratory searches.",
     )
     st.markdown(
-        '<div class="tip"><b>No API key needed.</b> Leads are collected from public search results. '
-        "Phone numbers and addresses appear only when the listing shows them. "
+        '<div class="tip"><b>Prototype · no API key.</b> Results come from OpenStreetMap, not a complete company database. '
+        "Coverage varies by place. Only publicly mapped contact fields are shown. "
         "City-level locations such as <b>Houston, Texas</b> work best.</div>",
         unsafe_allow_html=True,
     )
@@ -1161,8 +1338,8 @@ st.markdown(
     '<div class="hero">'
     '<span class="hero-badge"><i></i>Live Search Intelligence</span>'
     '<h1>🎯 B2B<span class="grad">Prospects.io</span><span class="sep">|</span>Elite Prospecting Portal</h1>'
-    "<p>Surface local businesses that are ready to buy. Find companies with no website, a social-media-only "
-    "presence or incomplete listings, then turn them into agency clients.</p>"
+    "<p>Find public business listings by company name or industry, review the available contact details, "
+    "and export a prospect list with source links.</p>"
     "</div>",
     unsafe_allow_html=True,
 )
@@ -1171,10 +1348,14 @@ st.markdown(
 # SEARCH DASHBOARD
 # ----------------------------------------------------------------------------
 with st.container(key="card_search"):
-    section_header("Step 1", "Search Dashboard", "Pick a niche and a market. We pull live data from public search results.")
+    section_header("Step 1", "Search Dashboard", "Search a company name or look up a supported business category in a city or region.")
+    search_mode = st.radio("Search type", ["Industry + location", "Company name"], horizontal=True, key="search_mode")
     c1, c2, c3 = st.columns([3, 3, 1.5], vertical_alignment="bottom")
-    keyword = c1.text_input("Target Industry / Keyword", placeholder="e.g. plumbers, dentists, roofing")
-    location = c2.text_input("Target Location", placeholder="e.g. Houston, Texas")
+    if search_mode == "Company name":
+        keyword = c1.text_input("Company Name", placeholder="e.g. Acme Roofing")
+    else:
+        keyword = c1.text_input("Industry / Business Type", placeholder="e.g. plumbers, dentists, roofing")
+    location = c2.text_input("City / Region", placeholder="e.g. Houston, Texas")
     search_clicked = c3.button("🔍 Find Prospects", type="primary", use_container_width=True)
 
 if search_clicked:
@@ -1186,24 +1367,26 @@ if search_clicked:
     else:
         try:
             with st.spinner("Searching public listings..."):
-                df, place_name = fetch_leads(keyword, location, max_results)
+                df, place_name = fetch_leads(keyword, location, max_results, search_mode)
             if df.empty:
                 st.session_state["leads"] = None
                 st.warning(
-                    f"No businesses found for “{keyword}” in “{location}”. "
-                    "Try a broader keyword (for example “dentist”) or a larger area."
+                    f"No matching businesses were found for “{keyword}” near “{location}” in OpenStreetMap. "
+                    "Coverage varies. Try a broader search term or a nearby larger city."
                 )
             else:
                 st.session_state["leads"] = df
                 st.session_state["meta"] = f"{keyword} — {place_name}"
+                if search_mode == "Industry + location" and industry_selectors(keyword) is None:
+                    st.info("This business type is not in the prototype's category map, so results are matched by business name. It may miss relevant companies.")
+                st.info("Data source: OpenStreetMap. This is a community-mapped dataset, so missing websites, emails, phones, and businesses do not mean they do not exist.")
         except SearchBlocked:
             st.error(
-                "⏳ Public search instances are refusing requests right now. This can happen when a shared "
-                "provider applies a temporary limit. Wait 10–15 minutes before trying once more; repeated "
-                "retries may extend the restriction. Your dashboard layout and saved features are unchanged."
+                "⏳ The public OpenStreetMap service has temporarily limited requests. Please wait before retrying; "
+                "repeated requests may prolong the limit. This prototype is intended for small, occasional tests."
             )
         except SearchUnavailable as e:
-            st.error(f"🌐 The search service is unreachable right now. Please retry shortly. ({e})")
+            st.error(f"🌐 The public data service could not complete this search. Please retry later. ({e})")
         except Exception as e:
             st.error(f"Unexpected error: {e}")
 
@@ -1214,7 +1397,7 @@ leads: pd.DataFrame | None = st.session_state["leads"]
 
 if leads is None:
     with st.container(key="card_empty"):
-        section_header("Getting started", "Your prospect pipeline is empty", "Three quick steps to your first list of agency-ready leads.")
+        section_header("Getting started", "Try a small business search", "This prototype searches public OpenStreetMap records. Results vary by location and category.")
         st.markdown(
             '<div class="steps">'
             '<div class="step"><div class="step-n">1</div><div class="step-t">Choose your niche</div>'
@@ -1329,66 +1512,40 @@ with st.container(key="card_table"):
                 "Email": st.column_config.TextColumn("Email", width="medium"),
                 "Physical Address": st.column_config.TextColumn("Physical Address", width="large"),
                 "Map": st.column_config.LinkColumn("Map", display_text="View ↗", width="small"),
+                "Source": st.column_config.LinkColumn("OSM Source", display_text="Open source ↗", width="small"),
             },
         )
 
 # ----------------------------------------------------------------------------
-# MONETIZATION PAYWALL
+# PROTOTYPE EXPORTS (payments are intentionally not connected in this test build)
 # ----------------------------------------------------------------------------
-if st.session_state["unlocked"]:
-    with st.container(key="card_unlocked"):
-        st.markdown(
-            '<div class="wall"><div class="wall-ico" style="background:rgba(16,185,129,.12);'
-            'border-color:rgba(16,185,129,.45)">🔓</div>'
-            '<div><p class="wall-title">Export Unlocked</p>'
-            '<p class="wall-text">Unlimited lifetime downloads are active. Your current filtered view is ready to export.</p>'
-            "</div></div>",
-            unsafe_allow_html=True,
+with st.container(key="card_unlocked"):
+    st.markdown(
+        '<div class="wall"><div class="wall-ico" style="background:rgba(16,185,129,.12);'
+        'border-color:rgba(16,185,129,.45)">🧪</div>'
+        '<div><p class="wall-title">Prototype Preview</p>'
+        '<p class="wall-text">Exports are enabled so the sample data can be evaluated. Payments and paid access are not connected in this prototype.</p>'
+        '</div></div>',
+        unsafe_allow_html=True,
+    )
+    if not filtered.empty:
+        slug = re.sub(r"[^a-z0-9]+", "_", st.session_state["meta"].lower()).strip("_") or "leads"
+        d1, d2, _ = st.columns([1.2, 1.2, 4])
+        d1.download_button(
+            "⬇️ Download CSV",
+            data=filtered.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"b2bprospects_{slug}.csv",
+            mime="text/csv",
+            use_container_width=True,
         )
-        if not filtered.empty:
-            slug = re.sub(r"[^a-z0-9]+", "_", st.session_state["meta"].lower()).strip("_") or "leads"
-            d1, d2, _ = st.columns([1.2, 1.2, 4])
-            d1.download_button(
-                "⬇️ Download CSV",
-                data=filtered.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"b2bprospects_{slug}.csv",
-                mime="text/csv",
+        xlsx = to_excel_bytes(filtered)
+        if xlsx:
+            d2.download_button(
+                "⬇️ Download Excel",
+                data=xlsx,
+                file_name=f"b2bprospects_{slug}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
-            xlsx = to_excel_bytes(filtered)
-            if xlsx:
-                d2.download_button(
-                    "⬇️ Download Excel",
-                    data=xlsx,
-                    file_name=f"b2bprospects_{slug}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-else:
-    with st.container(key="card_paywall"):
-        st.markdown(
-            '<div class="wall"><div class="wall-ico">🔒</div><div>'
-            '<p class="wall-title">🔒 CSV/Excel Export is Locked.</p>'
-            '<p class="wall-text">Unlock unlimited lifetime downloads for a one-time fee of <b>$49</b> at '
-            f'<a href="{CHECKOUT_URL}" target="_blank">b2bprospects.io</a></p>'
-            "</div></div>"
-            '<div class="wall-badges"><span>✓ One-time payment</span><span>✓ Lifetime access</span>'
-            "<span>✓ CSV + Excel exports</span></div>",
-            unsafe_allow_html=True,
-        )
-        with st.form("license_form", border=False):
-            k1, k2 = st.columns([3, 1.2], vertical_alignment="bottom")
-            entered = k1.text_input(
-                "Enter License Key to Unlock Download",
-                type="password",
-                placeholder="Paste your license key",
-            )
-            submitted = k2.form_submit_button("🔓 Unlock Download", type="primary", use_container_width=True)
-        if submitted:
-            if hmac.compare_digest(entered.strip().encode(), get_license_key().encode()):
-                st.session_state["unlocked"] = True
-                st.rerun()
-            else:
-                st.error("❌ Invalid license key. Please check it and try again.")
 
 render_footer()
