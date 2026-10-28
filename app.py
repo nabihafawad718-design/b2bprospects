@@ -6,7 +6,7 @@ import html
 import io
 import re
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import pandas as pd
 import requests
@@ -586,6 +586,69 @@ def parse_elements(elements: list[dict]) -> pd.DataFrame:
     return df.sort_values("Company Name", key=lambda s: s.str.lower()).reset_index(drop=True)
 
 
+def _extract_public_contacts(page_html: str) -> tuple[str | None, str | None]:
+    """Extract only contact details explicitly present in fetched public HTML."""
+    emails = re.findall(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", page_html)
+    phones = re.findall(r"(?<!\w)(?:\+?\d[\d().\s-]{7,}\d)(?!\w)", page_html)
+    email = next((e.lower() for e in emails if not e.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))), None)
+    phone = None
+    for candidate in phones:
+        digits = re.sub(r"\D", "", candidate)
+        if 10 <= len(digits) <= 15:
+            phone = re.sub(r"\s+", " ", candidate).strip(" .-")
+            break
+    return email, phone
+
+
+def enrich_public_websites(df: pd.DataFrame, max_sites: int = 20) -> pd.DataFrame:
+    """Try a small, bounded set of business home/contact pages; never bypass access controls."""
+    if df.empty or "Website" not in df.columns:
+        return df
+    result = df.copy()
+    checked = 0
+    for idx, row in result.iterrows():
+        if checked >= max_sites:
+            break
+        website = row.get("Website")
+        missing_email = not isinstance(row.get("Email"), str) or not row.get("Email", "").strip()
+        missing_phone = not isinstance(row.get("Phone Number"), str) or not row.get("Phone Number", "").strip()
+        if not isinstance(website, str) or not website.strip() or not (missing_email or missing_phone):
+            continue
+        if is_social_host(website):
+            continue
+        checked += 1
+        try:
+            response = requests.get(website, headers=HTTP_HEADERS, timeout=(4, 6), allow_redirects=True)
+            if response.status_code != 200 or "text/html" not in response.headers.get("Content-Type", "text/html"):
+                continue
+            html_text = response.text[:700_000]
+            email, phone = _extract_public_contacts(html_text)
+            # Check one clearly labelled contact/about page if homepage is missing a field.
+            if (missing_email and not email) or (missing_phone and not phone):
+                links = re.findall("(?is)<a\\b[^>]*href\\s*=\\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", html_text)
+                for href, label_html in links:
+                    label = re.sub(r"<[^>]+>", " ", label_html).lower()
+                    if any(term in (label + " " + href.lower()) for term in ("contact", "about", "impressum")):
+                        target = urljoin(response.url, href)
+                        if urlparse(target).hostname != urlparse(response.url).hostname:
+                            continue
+                        try:
+                            sub = requests.get(target, headers=HTTP_HEADERS, timeout=(3, 5), allow_redirects=True)
+                            if sub.status_code == 200 and "text/html" in sub.headers.get("Content-Type", "text/html"):
+                                e2, p2 = _extract_public_contacts(sub.text[:500_000])
+                                email, phone = email or e2, phone or p2
+                        except requests.RequestException:
+                            pass
+                        break
+            if missing_email and email:
+                result.at[idx, "Email"] = email
+            if missing_phone and phone:
+                result.at[idx, "Phone Number"] = phone
+        except requests.RequestException:
+            continue
+    return result
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_leads(keyword: str, location: str, max_results: int) -> tuple[pd.DataFrame, str]:
     geo = geocode_location(location)
@@ -601,7 +664,11 @@ def fetch_leads(keyword: str, location: str, max_results: int) -> tuple[pd.DataF
         elements = run_overpass(build_overpass_query(keyword, scope, max_results))
         if elements:
             break
-    return parse_elements(elements), geo["name"]
+    df = parse_elements(elements)
+    # Small bounded pass to fill missing contact fields from businesses' own public websites.
+    # This is best-effort; inaccessible pages and absent details remain blank.
+    df = enrich_public_websites(df, max_sites=20)
+    return df, geo["name"]
 
 
 # ----------------------------------------------------------------------------
@@ -759,7 +826,7 @@ if search_clicked:
         st.warning("The keyword needs at least one letter or number, for example “plumbers”.")
     else:
         try:
-            with st.spinner("Searching OpenStreetMap... large cities can take up to a minute."):
+            with st.spinner("Searching OpenStreetMap and checking a limited number of public business websites... this may take longer."):
                 df, place_name = fetch_leads(keyword, location, max_results)
             if df.empty:
                 st.session_state["leads"] = None
