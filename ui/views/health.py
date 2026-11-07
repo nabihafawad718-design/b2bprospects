@@ -9,6 +9,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
+from core.adapters.registry import CONFIG_ERRORS, available_adapters
 from core.runs import clear_history, health_dashboard, load_history, prune_history
 from core.settings import SETTINGS
 from ui.components import health_badge, kv, metric_card, metric_grid, notes, section_header
@@ -24,6 +25,18 @@ def render() -> None:
             "Every run is compared with the recent baseline for the same site. "
             "A redesign that halves the record count shows up here instead of in a customer's inbox.",
         )
+        with st.expander("Supported adapters and site configurations", expanded=False):
+            st.dataframe(
+                pd.DataFrame(available_adapters()),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                "A new site can be supported without Python by adding a JSON file in "
+                "core/adapters/sites/. Restart the app after adding one."
+            )
+            if CONFIG_ERRORS:
+                notes(CONFIG_ERRORS, error=True)
         if not rows:
             st.info(
                 "No runs recorded yet. Run an extraction and this page starts tracking that site."

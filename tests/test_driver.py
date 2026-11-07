@@ -1,6 +1,7 @@
 """Playwright session control-flow tests using a fake Playwright module."""
 from __future__ import annotations
 
+import dataclasses
 import unittest
 
 from tests import fake_playwright
@@ -13,6 +14,9 @@ from core.browser.driver import (
     PlaywrightSession,
     playwright_available,
 )
+from core.settings import SETTINGS
+
+_OFFLINE = dataclasses.replace(SETTINGS, robots_policy="ignore")
 
 
 class DriverTests(unittest.TestCase):
@@ -21,7 +25,7 @@ class DriverTests(unittest.TestCase):
 
     def _session(self, **kwargs) -> PlaywrightSession:
         fake_playwright.install(**kwargs)
-        return PlaywrightSession(respect_robots=False, nav_timeout_ms=5_000)
+        return PlaywrightSession(settings=_OFFLINE, respect_robots=False, nav_timeout_ms=5_000)
 
     def test_open_returns_rendered_page(self):
         session = self._session(html="<html><body><h1>Agents</h1></body></html>", title="Agents")
@@ -73,7 +77,7 @@ class DriverTests(unittest.TestCase):
 
     def test_click_and_scroll(self):
         page, _module = fake_playwright.install()
-        session = PlaywrightSession(respect_robots=False)
+        session = PlaywrightSession(settings=_OFFLINE, respect_robots=False)
         with session:
             session.open("https://example.com/agents")
             self.assertTrue(session.click("a.next"))
@@ -84,14 +88,14 @@ class DriverTests(unittest.TestCase):
 
     def test_click_failure_returns_false(self):
         fake_playwright.install(click_raises=True)
-        session = PlaywrightSession(respect_robots=False)
+        session = PlaywrightSession(settings=_OFFLINE, respect_robots=False)
         with session:
             session.open("https://example.com/agents")
             self.assertFalse(session.click("a.next"))
 
     def test_close_resets_session(self):
         page, module = fake_playwright.install()
-        session = PlaywrightSession(respect_robots=False)
+        session = PlaywrightSession(settings=_OFFLINE, respect_robots=False)
         session.start()
         session.close()
         self.assertIsNone(session._page)
@@ -101,7 +105,7 @@ class DriverTests(unittest.TestCase):
         fake_playwright.uninstall()
         if playwright_available():
             self.skipTest("Playwright is genuinely installed in this environment")
-        session = PlaywrightSession(respect_robots=False)
+        session = PlaywrightSession(settings=_OFFLINE, respect_robots=False)
         with self.assertRaises(BrowserUnavailable) as ctx:
             session.start()
         self.assertIn("playwright install chromium", str(ctx.exception))

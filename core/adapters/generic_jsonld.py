@@ -22,6 +22,8 @@ from ..normalize import (
     normalize_org,
     normalize_phone,
     parse_address,
+    same_site,
+    slugify,
 )
 from .base import AdapterContext, DirectoryAdapter
 from .generic_html import heuristic_profile, next_page_urls_from_soup
@@ -81,6 +83,9 @@ def _address_fields(value) -> dict[str, str]:
         city = clean_text(value.get("addressLocality") or "")
         state = clean_text(value.get("addressRegion") or "")
         postal = clean_text(value.get("postalCode") or "")
+        country = clean_text(value.get("addressCountry") or "")
+        if isinstance(country, dict):
+            country = clean_text(country.get("name") or country.get("@id") or "")
         if not street and not city:
             return {}
         return {
@@ -88,6 +93,7 @@ def _address_fields(value) -> dict[str, str]:
             "city": city,
             "state": state.upper() if len(state) == 2 else state,
             "postal_code": postal,
+            "country": country,
         }
     if isinstance(value, list):
         for item in value:
@@ -102,6 +108,51 @@ def _person_nodes(blocks: list[dict]) -> list[dict]:
     # Prefer the richest node when several describe the same person.
     people.sort(key=lambda n: len(n), reverse=True)
     return people
+
+
+def _person_fields(person: dict) -> dict[str, str]:
+    """Map one schema.org Person/RealEstateAgent node onto record fields."""
+    fields: dict[str, str] = {}
+
+    name = normalize_name(_as_text(person.get("name")))
+    if not name:
+        first = _as_text(person.get("givenName") or person.get("firstName"))
+        last = _as_text(person.get("familyName") or person.get("lastName"))
+        name = normalize_name(" ".join(part for part in (first, last) if part))
+    if name:
+        fields["agent_name"] = name
+
+    org = _as_text(person.get("worksFor")) or _as_text(person.get("memberOf")) \
+        or _as_text(person.get("affiliation")) or _as_text(person.get("parentOrganization"))
+    if org:
+        fields["brokerage_name"] = normalize_org(org)
+
+    telephone = person.get("telephone")
+    if isinstance(telephone, list):
+        telephone = telephone[0] if telephone else ""
+    display, _digits = normalize_phone(telephone or "")
+    if display:
+        fields["phone"] = display
+
+    email = normalize_email(person.get("email"))
+    if not email:
+        found = find_emails(_as_text(person.get("email")) or "", limit=1)
+        email = found[0] if found else ""
+    if email:
+        fields["email"] = email
+
+    fields.update({k: v for k, v in _address_fields(person.get("address")).items() if v})
+
+    for key, label in (("jobTitle", "title"), ("worksFor", "")):
+        if label:
+            value = _as_text(person.get(key))
+            if value:
+                fields[slugify(label)] = value
+    languages = person.get("knowsLanguage") or person.get("languages")
+    language_text = _as_text(languages)
+    if language_text:
+        fields["languages"] = language_text
+    return fields
 
 
 class GenericJsonLdAdapter(DirectoryAdapter):
@@ -134,6 +185,8 @@ class GenericJsonLdAdapter(DirectoryAdapter):
                         inner = item.get("item")
                         if isinstance(inner, dict) and isinstance(inner.get("url"), str):
                             target = inner["url"]
+                        elif isinstance(inner, dict) and isinstance(inner.get("@id"), str):
+                            target = inner["@id"]
                     if isinstance(target, str):
                         links.append(urljoin(page.final_url, target))
             if _types_of(node) & _PERSON_TYPES and isinstance(node.get("url"), str):
@@ -145,6 +198,47 @@ class GenericJsonLdAdapter(DirectoryAdapter):
                 soup, page.final_url, host_of(page.final_url)
             )
         return [canonical_url(u) for u in dict.fromkeys(links) if u]
+
+    def listing_records(self, page: FetchedPage, ctx: AdapterContext) -> list[RawRecord]:
+        """Use complete Person nodes on the listing page without opening profiles."""
+        blocks: list[dict] = []
+        for block in _iter_jsonld_blocks(page.text):
+            _flatten(block, blocks)
+
+        people: list[dict] = []
+        for node in blocks:
+            if _types_of(node) & _PERSON_TYPES:
+                people.append(node)
+            items = node.get("itemListElement")
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict) and isinstance(item.get("item"), dict):
+                        inner = item["item"]
+                        if _types_of(inner) & _PERSON_TYPES:
+                            people.append(inner)
+
+        records: list[RawRecord] = []
+        seen: set[str] = set()
+        for person in people:
+            fields = _person_fields(person)
+            if not fields.get("agent_name"):
+                continue
+            if not any(fields.get(key) for key in ("phone", "email", "street_address", "city", "website", "profile_url")):
+                continue
+            key = fields.get("email") or fields.get("phone") or fields["agent_name"].lower()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            declared = person.get("url")
+            profile_url = canonical_url(urljoin(page.final_url, declared)) if isinstance(declared, str) else ""
+            records.append(RawRecord(
+                fields=fields,
+                profile_url=profile_url,
+                source_url=canonical_url(page.final_url),
+                method="json-ld (listing)",
+            ))
+        return records
 
     def next_page_urls(self, page: FetchedPage, ctx: AdapterContext) -> list[str]:
         return next_page_urls_from_soup(parse_html(page.text), page.final_url, ctx.max_list_pages)
@@ -162,32 +256,7 @@ class GenericJsonLdAdapter(DirectoryAdapter):
             return record
 
         person = people[0]
-        fields: dict[str, str] = {}
-
-        name = normalize_name(_as_text(person.get("name")))
-        if name:
-            fields["agent_name"] = name
-
-        org = _as_text(person.get("worksFor")) or _as_text(person.get("memberOf")) \
-            or _as_text(person.get("affiliation")) or _as_text(person.get("parentOrganization"))
-        if org:
-            fields["brokerage_name"] = normalize_org(org)
-
-        telephone = person.get("telephone")
-        if isinstance(telephone, list):
-            telephone = telephone[0] if telephone else ""
-        display, _digits = normalize_phone(telephone or "")
-        if display:
-            fields["phone"] = display
-
-        email = normalize_email(person.get("email"))
-        if not email:
-            found = find_emails(_as_text(person.get("email")) or "", limit=1)
-            email = found[0] if found else ""
-        if email:
-            fields["email"] = email
-
-        fields.update({k: v for k, v in _address_fields(person.get("address")).items() if v})
+        fields = _person_fields(person)
 
         # Structured data is often sparse on profiles; fill gaps from the page.
         if len(fields) < 4:
@@ -201,8 +270,10 @@ class GenericJsonLdAdapter(DirectoryAdapter):
 
         profile_url = canonical_url(page.final_url)
         declared = person.get("url")
-        if isinstance(declared, str) and host_of(declared) == host_of(page.final_url):
-            profile_url = canonical_url(urljoin(page.final_url, declared))
+        if isinstance(declared, str):
+            resolved = urljoin(page.final_url, declared)
+            if same_site(resolved, page.final_url):
+                profile_url = canonical_url(resolved)
 
         return RawRecord(
             fields=fields,

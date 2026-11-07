@@ -1,5 +1,10 @@
 # Phase 2 — Technical audit
 
+> **Historical document.** The v3 work supersedes several gaps recorded here:
+> visual click-to-select is now implemented as a Streamlit component, embedded
+> Next.js flight data is supported, and the engine has broader detection and
+> cleaning. See `docs/V3_CHANGES.md` for the current record.
+
 Date: 2026-11-07
 Scope: turn the Phase 1 MVP into a working browser-based extraction platform.
 

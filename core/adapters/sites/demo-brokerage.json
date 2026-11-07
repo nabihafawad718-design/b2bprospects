@@ -1,0 +1,36 @@
+{
+  "id": "demo_brokerage",
+  "label": "Bundled demo directory",
+  "domains": ["127.0.0.1", "localhost"],
+  "description": "Config-driven adapter for the local demo server (scripts/serve_demo.py). It demonstrates supporting a site without writing Python.",
+  "listing": {
+    "row": "article.demo-card",
+    "profile_link": "a.demo-card__link",
+    "next": "a.demo-next",
+    "page_param": "page",
+    "max_pages": 20,
+    "record_fields": {
+      "agent_name": ".demo-card__name",
+      "brokerage_name": ".demo-card__office",
+      "phone": ".demo-card__phone",
+      "email": ".demo-card__email",
+      "street_address": ".demo-card__address",
+      "title": ".demo-card__title",
+      "license_number": ".demo-card__license",
+      "profile_url": "a.demo-card__link@href"
+    }
+  },
+  "profile": {
+    "fields": {
+      "agent_name": "h1.demo-profile__name",
+      "brokerage_name": ".demo-profile__office",
+      "phone": "a.demo-profile__phone",
+      "email": "a.demo-profile__email",
+      "street_address": "address.demo-profile__address",
+      "website": "a.demo-profile__website@href",
+      "title": ".demo-profile__title",
+      "license_number": ".demo-profile__license"
+    },
+    "expected_fields": ["agent_name", "phone", "email", "profile_url"]
+  }
+}

@@ -10,12 +10,18 @@ To support a new site permanently, add its class to `SITE_ADAPTERS`.
 from __future__ import annotations
 
 from .base import DirectoryAdapter
+from .config_adapter import load_config_adapters
 from .custom_site import CustomSiteAdapter
 from .generic_html import GenericHtmlAdapter
 from .generic_jsonld import GenericJsonLdAdapter
 
-# Site-specific adapters live here. Order matters: first match wins.
+# Config-driven adapters are loaded once at import. Order matters: first match wins.
+_CONFIG_ADAPTERS, CONFIG_ERRORS = load_config_adapters()
+
+# Site-specific adapters live here. Add a Python adapter class, or drop a JSON
+# file in core/adapters/sites/ for the no-code path.
 SITE_ADAPTERS: list[DirectoryAdapter] = [
+    *_CONFIG_ADAPTERS,
     CustomSiteAdapter(),
 ]
 
@@ -28,6 +34,8 @@ def available_adapters() -> list[dict[str, str]]:
     for adapter in SITE_ADAPTERS:
         if not adapter.domains:
             continue  # template not yet configured for a real site
+        if adapter.id == "custom_site":
+            continue  # the Python template is documentation, not a live adapter
         rows.append({
             "id": adapter.id,
             "label": adapter.label,

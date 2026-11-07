@@ -75,8 +75,9 @@ with st.sidebar:
         max_results = 100
         st.markdown(
             f'<div class="tip"><b>Polite by default.</b> Requests are spaced '
-            f"{SETTINGS.request_delay_seconds:g}s apart, robots.txt is honoured, and login-walled or "
-            "CAPTCHA-protected pages are never touched. Collect only what the site publishes publicly.</div>",
+            f"{SETTINGS.request_delay_seconds:g}s apart and robots.txt status is reported. "
+            "Login-walled or CAPTCHA-protected pages are never touched. Collect only what the "
+            "site publishes publicly.</div>",
             unsafe_allow_html=True,
         )
 
@@ -93,10 +94,10 @@ with st.sidebar:
 # HEADER ZONE
 # ----------------------------------------------------------------------------
 if selected_view == "Directory Extraction":
-    hero_badge = "Public Business Data · Maintained Adapters"
+    hero_badge = "Public Business Data · Visual Extraction"
     hero_lede = (
-        "Point it at a brokerage directory, see exactly what can be collected, then export a clean, "
-        "deduplicated agent list with a full source trail."
+        "Point it at a public directory, click the fields you want, follow the pagination, "
+        "clean the records, and export a deduplicated dataset with a full source trail."
     )
 elif selected_view == "Local Discovery":
     hero_badge = "Free OpenStreetMap Intelligence"

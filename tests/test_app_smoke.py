@@ -233,6 +233,80 @@ class AppSmokeTests(unittest.TestCase):
         self.assertEqual(_errors(), [], _errors())
         self.assertEqual(_exceptions(), [])
 
+    def test_visual_picker_selection_updates_the_mapping(self):
+        from core.browser.structure import analyze_html
+        from core.models import BrowserInspection
+        from ui.views import browser_flow
+
+        html = (Path(__file__).parent / "fixtures" / "browser" / "roster_p1.html").read_text(encoding="utf-8")
+        model = analyze_html(html, BASE)[0]
+        name_col = next(c for c in model.columns if c.kind_hint == "name")
+        inspection = BrowserInspection(
+            url=BASE, final_url=BASE, title="Our Agents", status_code=200, rendered=True,
+            rendered_html=html, row_count=model.row_count, structure=model, candidates=[model],
+            pagination={"strategy": "next_button", "reason": "Found a next-page link."},
+        )
+        streamlit_stub.session_state["nav"] = "Directory Extraction"
+        streamlit_stub.session_state["x_mode"] = "Browser"
+        streamlit_stub.session_state["x_url_input"] = BASE
+        streamlit_stub.session_state["x_browser_inspection"] = inspection
+        streamlit_stub.session_state["x_browser_html"] = html
+
+        original_render = browser_flow.render_picker
+        original_message = browser_flow.snapshot_message
+        browser_flow.render_picker = lambda *a, **k: {
+            "seq": 123.0, "path": name_col.path, "text": "Jane Smith",
+            "row_selector": "article.agent-card", "group_count": 12,
+        }
+        browser_flow.snapshot_message = lambda *a, **k: ""
+        try:
+            _load_app("app_browser_visual")
+        finally:
+            browser_flow.render_picker = original_render
+            browser_flow.snapshot_message = original_message
+
+        texts = " ".join(body for _kind, body in streamlit_stub.rendered)
+        self.assertEqual(_errors(), [], _errors())
+        self.assertEqual(_exceptions(), [])
+        self.assertEqual(streamlit_stub.session_state.get("bm_field_agent_name"), name_col.index)
+        self.assertIn("Preview of the first records", texts)
+
+    def test_browser_embedded_only_renders_extraction_card(self):
+        from core.models import BrowserInspection
+
+        streamlit_stub.session_state["nav"] = "Directory Extraction"
+        streamlit_stub.session_state["x_mode"] = "Browser"
+        streamlit_stub.session_state["x_url_input"] = BASE
+        streamlit_stub.session_state["x_browser_inspection"] = BrowserInspection(
+            url=BASE, final_url=BASE, title="Our Agents", status_code=200, rendered=True,
+            rendered_html="<html><body>payload only</body></html>",
+            embedded_record_count=8, embedded_keys=["__NEXT_DATA__"],
+            embedded_payloads=["__NEXT_DATA__"],
+            pagination={"strategy": "query_param", "reason": "page param"},
+        )
+        streamlit_stub.session_state["x_browser_html"] = "<html><body>payload only</body></html>"
+        _load_app("app_browser_embedded_only")
+        texts = " ".join(body for _kind, body in streamlit_stub.rendered)
+        self.assertIn("Records found in embedded data", texts)
+        self.assertEqual(_errors(), [], _errors())
+        self.assertEqual(_exceptions(), [])
+
+    def test_browser_no_records_explains_instead_of_blank(self):
+        from core.models import BrowserInspection
+
+        streamlit_stub.session_state["nav"] = "Directory Extraction"
+        streamlit_stub.session_state["x_mode"] = "Browser"
+        streamlit_stub.session_state["x_url_input"] = BASE
+        streamlit_stub.session_state["x_browser_inspection"] = BrowserInspection(
+            url=BASE, final_url=BASE, title="Search", status_code=200, rendered=True,
+            rendered_html="<html><body>nothing</body></html>",
+        )
+        streamlit_stub.session_state["x_browser_html"] = "<html><body>nothing</body></html>"
+        _load_app("app_browser_no_records")
+        texts = " ".join(body for _kind, body in streamlit_stub.rendered)
+        self.assertIn("No repeating records or embedded payload", texts)
+        self.assertEqual(_errors(), [], _errors())
+
     def test_paywall_enabled_renders_lock(self):
         from ui import components
 

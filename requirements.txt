@@ -2,6 +2,7 @@ streamlit>=1.39
 pandas>=2.0
 requests>=2.31
 beautifulsoup4>=4.12
+soupsieve>=2.5
 lxml>=5.0
 openpyxl>=3.1
 

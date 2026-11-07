@@ -13,25 +13,29 @@ judgement the checklist at the end asks you to make explicitly.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.browser.embedded import blob_keys                      # noqa: E402
-from core.browser.structure import analyze_html                   # noqa: E402
-from core.inspect_site import inspect_url                         # noqa: E402
-from core.net import FetchError, PoliteFetcher, RobotsDisallowed  # noqa: E402
-from core.normalize import host_of                                # noqa: E402
+from core.browser.embedded import blob_keys, extract_from_embedded  # noqa: E402
+from core.browser.structure import analyze_html                     # noqa: E402
+from core.inspect_site import inspect_url                           # noqa: E402
+from core.net import FetchError, PoliteFetcher, RobotsDisallowed     # noqa: E402
+from core.normalize import host_of                                  # noqa: E402
+from core.settings import SETTINGS                                  # noqa: E402
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Assess a directory before committing to it.")
     parser.add_argument("url", help="The listing/roster URL")
     parser.add_argument("--delay", type=float, default=1.0, help="Seconds between requests")
+    parser.add_argument("--allow-local", action="store_true", help="Permit localhost for the demo server")
     args = parser.parse_args()
 
-    fetcher = PoliteFetcher()
+    settings = dataclasses.replace(SETTINGS, allow_local_urls=args.allow_local)
+    fetcher = PoliteFetcher(settings)
     print("=" * 72)
     print("B2BProspects — directory assessment")
     print("=" * 72)
@@ -42,8 +46,8 @@ def main() -> int:
     try:
         report = inspect_url(args.url, fetcher)
     except RobotsDisallowed as exc:
-        print(f"STOP: robots.txt disallows this path.\n  {exc}")
-        print("\nDo not proceed without written permission from the site owner.")
+        print(f"robots.txt enforcement is on and this path is disallowed:\n  {exc}")
+        print("Set B2B_ROBOTS_POLICY=warn to inspect it and decide on permission separately.")
         return 1
     except FetchError as exc:
         print(f"Could not fetch the page: {exc}")
@@ -53,7 +57,10 @@ def main() -> int:
     print(f"Final URL        : {report.final_url}")
     print(f"Page title       : {report.page_title or '(none)'}")
     print(f"robots.txt       : {report.robots_detail or 'not checked'}")
-    print(f"Content type     : HTML")
+    if not report.robots_allowed:
+        print("                   NOTE: this path is disallowed by robots.txt. It is reported, not")
+        print("                   automatically blocked. Review the site's terms and permission.")
+    print("Content type     : HTML")
     print()
 
     print("--- What the server sends (no JavaScript) ---")
@@ -81,6 +88,9 @@ def main() -> int:
     blobs = blob_keys(html)
     if blobs:
         print(f"Embedded payloads: {', '.join(blobs[:5])}")
+    embedded, payload = extract_from_embedded(html, report.final_url)
+    if embedded:
+        print(f"Embedded records : {len(embedded)}  payload={payload}")
     print()
 
     print("--- Permission checklist (you must confirm each of these) ---")

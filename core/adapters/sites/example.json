@@ -1,0 +1,24 @@
+{
+  "id": "example_template",
+  "label": "Example site adapter template",
+  "domains": [],
+  "description": "Copy this file, set domains and selectors, then restart the app.",
+  "listing": {
+    "row": "div.agent-card",
+    "profile_link": "a.agent-card__link",
+    "next": "a.pagination__next",
+    "page_param": "page",
+    "max_pages": 50
+  },
+  "profile": {
+    "fields": {
+      "agent_name": "h1.agent-name",
+      "brokerage_name": ".office-name",
+      "phone": "a[href^='tel:']",
+      "email": "a[href^='mailto:']",
+      "street_address": "address",
+      "website": ".website a@href"
+    },
+    "expected_fields": ["agent_name", "phone", "email", "profile_url"]
+  }
+}

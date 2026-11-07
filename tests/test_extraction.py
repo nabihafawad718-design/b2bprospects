@@ -193,6 +193,12 @@ class EdgeCaseTests(unittest.TestCase):
         report = inspect_page(page, check_sitemap=False)
         self.assertEqual(report.profile_link_count, 0)
 
+    def test_blog_listing_does_not_become_records(self):
+        site = FakeSite({"https://blog.example/news": BLOG_ROSTER})
+        result = run_extraction("https://blog.example/news", fetcher=site.fetcher(), persist=False)
+        self.assertEqual(result.records, [])
+        self.assertEqual(result.quality.level, "broken")
+
     def test_footer_year_is_not_pagination(self):
         from core.adapters.generic_html import next_page_urls_from_soup
         from core.inspect_site import parse_html

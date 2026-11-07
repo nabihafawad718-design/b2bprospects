@@ -1,18 +1,16 @@
 """JavaScript injected into the live page.
 
-These snippets are the browser-side foundation for visual selection. They are
-written as self-contained strings so they can be evaluated by Playwright exactly
-as-is, and are syntax-checked by the test suite with Node.
+These snippets are written as self-contained strings so they can be evaluated by
+Playwright exactly as-is, and are syntax-checked by the test suite with Node.
 
 `PICKER_JS` is a real element picker: hover highlights the element, a click
 resolves a stable CSS path, works out the repeated row that contains it, and
-stores the result on `window.__b2bPicker.result`. Python polls that value.
+stores the result on `window.__b2bPicker.result`. It is retained for
+Playwright-side selection experiments and as a reference.
 
-Why the click UI is not wired into Streamlit yet: Streamlit's built-in iframe
-component cannot send a value back to Python without a bidirectional custom
-component, and that component cannot be built or tested in this environment.
-The picker itself is complete and tested; only the transport is missing. See
-`docs/BROWSER_ENGINE.md`.
+The operator-facing visual picker is now a Streamlit custom component in
+`ui/visual_picker/`; it implements the component protocol directly and returns a
+position path to Python. See `docs/BROWSER_ENGINE.md` §7.
 """
 from __future__ import annotations
 
@@ -226,6 +224,48 @@ CONTENT_SIGNATURE_JS = r"""
 """
 
 
+# Click ordinary "show phone / show email / contact details" controls. This is
+# not a bypass: it only operates controls a visitor can operate, and never fills a
+# form, accepts terms, or opens a login wall. Returns the number clicked.
+REVEAL_CONTACT_JS = r"""
+(() => {
+  const patterns = [
+    /^show (phone|number|email|contact|details)$/i,
+    /^view (phone|number|email|contact|details|profile)$/i,
+    /^contact (agent|details|info)$/i,
+    /^agent (details|contact)$/i,
+    /^reveal (phone|email|contact)$/i,
+    /^see (phone|email|contact)$/i,
+    /^more (details|info)$/i
+  ];
+  const candidates = Array.from(document.querySelectorAll(
+    'button, [role="button"], a[href="#"], a[href^="javascript:"], summary, .accordion-title'
+  ));
+  let clicked = 0;
+  for (const el of candidates) {
+    const text = (el.innerText || el.getAttribute('aria-label') || '').trim();
+    if (!text || text.length > 36) continue;
+    if (!patterns.some(p => p.test(text))) continue;
+    try {
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      el.click();
+      clicked += 1;
+      if (clicked >= 4) break;
+    } catch (e) { /* ignore */ }
+  }
+  return clicked;
+})()
+"""
+
+
+COUNT_ROWS_JS = r"""
+(selector) => {
+  try { return document.querySelectorAll(selector).length; } catch (e) { return 0; }
+}
+"""
+
+
 ALL_JS_SNIPPETS = {
     "PICKER_JS": PICKER_JS,
     "READ_PICKER_JS": READ_PICKER_JS,
@@ -235,4 +275,6 @@ ALL_JS_SNIPPETS = {
     "PAGE_METRICS_JS": PAGE_METRICS_JS,
     "DISMISS_OVERLAYS_JS": DISMISS_OVERLAYS_JS,
     "CONTENT_SIGNATURE_JS": CONTENT_SIGNATURE_JS,
+    "REVEAL_CONTACT_JS": REVEAL_CONTACT_JS,
+    "COUNT_ROWS_JS": COUNT_ROWS_JS,
 }

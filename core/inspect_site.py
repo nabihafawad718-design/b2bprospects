@@ -17,7 +17,7 @@ import bs4
 
 from .models import InspectionReport, signature
 from .net import FetchedPage, FetchError, PoliteFetcher
-from .normalize import canonical_url, clean_text, find_emails, find_phones, host_of
+from .normalize import canonical_url, clean_text, find_emails, find_phones, host_of, same_site
 
 PROFILE_KEYWORDS = (
     "agent", "agents", "agent-profile", "team", "our-team", "people", "person", "profile",
@@ -107,13 +107,19 @@ _EXCLUDED_PREFIXES = {
     "blog", "news", "articles", "press", "events", "careers", "jobs", "faq",
     "support", "help", "legal", "privacy", "terms", "sitemap", "search",
 }
+# Root pages that contain the roster but are not themselves a profile.
+_SECTION_ROOTS = {
+    "agents", "agent", "team", "our-team", "people", "staff", "directory", "realtors",
+    "brokers", "associates", "members", "advisors", "attorneys", "professionals",
+    "contact", "about", "about-us", "home", "index",
+}
 
 
 def _looks_like_profile(href: str, base_host: str) -> bool:
     if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
         return False
     parsed = urlparse(href)
-    if parsed.hostname and host_of(parsed.hostname) != base_host:
+    if parsed.hostname and not same_site(parsed.hostname, base_host):
         return False
     path = parsed.path.lower()
     if not path or path in ("/", ""):
@@ -123,12 +129,15 @@ def _looks_like_profile(href: str, base_host: str) -> bool:
         return False
     if segments[0] in _EXCLUDED_PREFIXES:
         return False
+    # /agents or /team is the roster itself, not one person in it.
+    if len(segments) == 1 and segments[0] in _SECTION_ROOTS:
+        return False
     joined = "/".join(segments)
     if any(keyword in joined for keyword in PROFILE_KEYWORDS):
         return True
     # /jane-smith style single-segment slugs are common on brokerage sites
     if len(segments) == 1 and re.fullmatch(r"[a-z0-9][a-z0-9\-]{3,60}", segments[0]):
-        if not any(seg in ("contact", "about", "search", "login", "privacy", "terms", "blog", "news") for seg in segments):
+        if segments[0] not in _SECTION_ROOTS:
             return True
     if len(segments) >= 2 and re.fullmatch(r"[a-z0-9][a-z0-9\-]{2,60}", segments[-1]):
         return True
@@ -172,9 +181,37 @@ def discover_profile_links(soup: bs4.BeautifulSoup, base_url: str, host: str
         if len(profile_links) < 2:
             continue
         score = len(profile_links) * 3 + len(group)
+        # Page furniture can repeat too; never let a nav/footer outscore cards.
+        if parent.name in ("nav", "header", "footer") or parent.find_parent(["nav", "header", "footer"]):
+            score -= 12
+        if len(profile_links) >= 3:
+            score += 4
         if best is None or score > best[0]:
             best = (score, parent, key, group, profile_links)
     if not best:
+        # Cards with unique per-record classes defeat the class grouping above.
+        # Reuse the browser structure detector, which has a tag-level fallback.
+        try:
+            from .browser.structure import analyze_html, select_rows
+
+            html = str(soup)
+            models = analyze_html(html, base_url)
+            if models:
+                model = models[0]
+                rows = select_rows(html, model)
+                links = []
+                for row in rows:
+                    for anchor in row.find_all("a", href=True):
+                        candidate = urljoin(base_url, str(anchor["href"]))
+                        if _looks_like_profile(candidate, host):
+                            links.append(candidate)
+                unique = list(dict.fromkeys(
+                    canonical_url(url) for url in links if url
+                ))
+                if len(unique) >= 2:
+                    return unique, model.signature, len(rows), model.row_selector
+        except Exception:
+            pass
         return [], "", 0, ""
 
     _score, parent, key, group, profile_links = best
@@ -204,6 +241,9 @@ def _derive_pattern(urls: list[str]) -> str:
     return Counter(shapes).most_common(1)[0][0][:120]
 
 
+_PAGE_PARAMS = ("page", "p", "pg", "paged", "start", "offset", "page_num", "pagenumber", "pageindex")
+
+
 def _detect_pagination(soup: bs4.BeautifulSoup, page_url: str) -> tuple[str, int, str]:
     for link in soup.find_all("a", href=True):
         rel = link.get("rel") or []
@@ -212,24 +252,38 @@ def _detect_pagination(soup: bs4.BeautifulSoup, page_url: str) -> tuple[str, int
         if any(str(r).lower() == "next" for r in rel):
             return "next_link", 1, ""
         text = clean_text(link.get_text()).lower()
-        if text in ("next", "next page", "›", "»", "next »", "››"):
+        aria = str(link.get("aria-label") or "").lower()
+        if text in ("next", "next page", "›", "»", "next »", "››") or aria in ("next", "next page"):
             return "next_link", 1, ""
 
-    numbered = []
+    # Numbered links only count when they sit together in one pager, so a footer
+    # copyright year is never mistaken for a page number.
+    by_parent: dict[int, set[int]] = {}
     for link in soup.find_all("a", href=True):
         text = clean_text(link.get_text())
-        if re.fullmatch(r"\d{1,4}", text) and int(text) < 5000:
-            numbered.append(int(text))
-    if len(numbered) >= 2:
-        return "numbered", max(numbered), ""
+        if not re.fullmatch(r"\d{1,3}", text):
+            continue
+        number = int(text)
+        if not (1 <= number <= 500):
+            continue
+        parent = link.parent
+        by_parent.setdefault(id(parent), set()).add(number)
+    pager = max(by_parent.values(), key=len, default=set())
+    if len(pager) >= 2:
+        return "numbered", max(pager), ""
 
     params = Counter()
     for link in soup.find_all("a", href=True):
         query = urlparse(urljoin(page_url, link["href"])).query
         for part in query.split("&"):
             key = part.split("=")[0].lower()
-            if key in ("page", "p", "pg", "paged", "start", "offset", "page_num", "pagenumber"):
+            if key in _PAGE_PARAMS:
                 params[key] += 1
+    # A page-2 link in the current URL is the strongest possible signal.
+    for part in urlparse(page_url).query.split("&"):
+        key = part.split("=")[0].lower()
+        if key in _PAGE_PARAMS:
+            params[key] += 3
     if params:
         key, _count = params.most_common(1)[0]
         return "query_param", 0, key
@@ -260,6 +314,8 @@ def inspect_page(page: FetchedPage, fetcher: PoliteFetcher | None = None,
         host=host_of(page.final_url),
         status_code=page.status_code,
         page_title=clean_text(soup.title.get_text()) if soup.title else "",
+        robots_allowed=page.robots_allowed,
+        robots_detail=page.robots_detail,
     )
 
     # --- structured data ---------------------------------------------------
@@ -308,7 +364,12 @@ def inspect_page(page: FetchedPage, fetcher: PoliteFetcher | None = None,
         if has_mailto or inline_emails:
             available.append("email")
         if has_address:
-            available.extend(["street_address", "city", "state"])
+            available.extend(["street_address", "city", "state", "postal_code", "country"])
+        if has_mailto or inline_emails:
+            available.append("email")
+        if any("website" in str(a.get("class") or "").lower() or "website" in str(a.get("href") or "").lower()
+               for a in anchors):
+            available.append("website")
         if report.profile_link_count:
             available.extend(["profile_url", "source_url", "brokerage_name"])
     report.available_fields = list(dict.fromkeys(available))
@@ -339,12 +400,21 @@ def inspect_page(page: FetchedPage, fetcher: PoliteFetcher | None = None,
             "A 'load more' control was found. Results beyond the first batch require the "
             "browser-automation path; the static extractor will only see the first batch."
         )
+    if not report.robots_allowed:
+        report.warnings.append(
+            f"robots.txt note: {report.robots_detail}. This run is not blocked by default because "
+            "robots.txt is a crawling convention, not a statement of permission. Review the site's "
+            "terms before commercial use; set B2B_ROBOTS_POLICY=enforce to block automatically."
+        )
 
     # --- sitemap (only when it would add information) -----------------------
     if check_sitemap and fetcher is not None and report.profile_link_count == 0:
         sitemap_url = urljoin(page.final_url, "/sitemap.xml")
         sitemap = fetcher.get_optional(sitemap_url)
-        report.sitemap_found = bool(sitemap and sitemap.status_code == 200 and "<urlset" in sitemap.text[:2000])
+        head = sitemap.text[:4000].lower() if sitemap else ""
+        report.sitemap_found = bool(
+            sitemap and sitemap.status_code == 200 and ("<urlset" in head or "<sitemapindex" in head)
+        )
 
     # --- recommendation ----------------------------------------------------
     types_lower = {t.lower() for t in report.jsonld_types}
@@ -372,7 +442,7 @@ def inspect_url(url: str, fetcher: PoliteFetcher, check_sitemap: bool = True) ->
         )
     report = inspect_page(page, fetcher, check_sitemap=check_sitemap)
     try:
-        report.robots_detail = fetcher.robots_status(url)
+        report.robots_detail = report.robots_detail or fetcher.robots_status(url)
     except Exception:
-        report.robots_detail = ""
+        report.robots_detail = report.robots_detail or ""
     return report

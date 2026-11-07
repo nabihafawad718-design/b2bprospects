@@ -8,7 +8,7 @@ name had to be guessed.
 from __future__ import annotations
 
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import bs4
 
@@ -24,7 +24,9 @@ from ..normalize import (
     normalize_name,
     normalize_org,
     normalize_phone,
+    normalize_website,
     parse_address,
+    tel_from_fragment,
 )
 from ..inspect_site import _detect_pagination
 from .base import AdapterContext, DirectoryAdapter
@@ -82,6 +84,10 @@ def _first_mailto(scope: bs4.BeautifulSoup) -> str:
 
 
 def _heading_name(soup: bs4.BeautifulSoup) -> str:
+    for el in soup.find_all(attrs={"itemprop": "name"}):
+        name = normalize_name(el.get_text(" ") or el.get("content") or "")
+        if 2 <= len(name.split()) <= 6:
+            return name
     for tag in ("h1",):
         for el in soup.find_all(tag):
             name = normalize_name(el.get_text(" "))
@@ -116,8 +122,17 @@ def heuristic_profile(soup: bs4.BeautifulSoup, page_url: str) -> RawRecord:
     for scope in scopes:
         if not phone:
             phone = _first_tel_anchor(scope)
+        if not phone:
+            phone_el = scope.find(attrs={"itemprop": "telephone"})
+            if phone_el:
+                phone = tel_from_fragment(phone_el.get("href") or phone_el.get_text(" ") or phone_el.get("content"))
         if not email:
             email = _first_mailto(scope)
+        if not email:
+            email_el = scope.find(attrs={"itemprop": "email"})
+            if email_el:
+                found = find_emails(email_el.get("href", "").replace("mailto:", "") or email_el.get_text(" "), limit=1)
+                email = found[0] if found else ""
         if not address_text:
             address_el = scope.find("address") or scope.find(attrs={"itemprop": "address"})
             if address_el:
@@ -155,6 +170,18 @@ def heuristic_profile(soup: bs4.BeautifulSoup, page_url: str) -> RawRecord:
     if address_text:
         parsed = parse_address(address_text)
         fields.update({k: v for k, v in parsed.items() if v})
+
+    # schema.org microdata and ordinary labelled links.
+    url_el = soup.find(attrs={"itemprop": "url"})
+    if url_el:
+        website = normalize_website(url_el.get("href") or url_el.get_text(" "))
+        if website:
+            fields["website"] = website
+    title_el = soup.find(attrs={"itemprop": "jobTitle"})
+    if title_el:
+        title = clean_text(title_el.get_text(" ") or title_el.get("content") or "")
+        if title:
+            fields["title"] = title[:120]
 
     # Brokerage: explicit markup, then og:site_name, then page title tail.
     org = ""
@@ -233,10 +260,29 @@ def next_page_urls_from_soup(soup: bs4.BeautifulSoup, base_url: str,
         kind, _pages, param = _detect_pagination(soup, base_url)
         if kind == "query_param" and param:
             limit = min(max_list_pages, 50)
-            for number in range(2, limit + 1):
-                parsed = urlparse(base_url)
-                sep = "&" if parsed.query else ""
-                urls.append(f"{base_url}{sep}{param}={number}")
+            parsed = urlparse(base_url)
+            base_values = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            raw_current = base_values.get(param, "0" if param in ("start", "offset") else "1")
+            current = (int(raw_current) if str(raw_current).isdigit()
+                       else (0 if param in ("start", "offset") else 1))
+            values: set[int] = set()
+            if str(base_values.get(param, "")).isdigit():
+                values.add(int(base_values[param]))
+            for link in soup.find_all("a", href=True):
+                for key, value in parse_qsl(urlparse(urljoin(base_url, link["href"])).query):
+                    if key.lower() == param.lower() and value.isdigit():
+                        values.add(int(value))
+            step = 1
+            if param in ("start", "offset"):
+                ordered = sorted(v for v in values if v >= 0)
+                gaps = [b - a for a, b in zip(ordered, ordered[1:]) if b > a]
+                if gaps:
+                    step = min(gaps)
+            for number in range(current + step, current + step * limit, step):
+                query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+                         if k.lower() != param.lower()]
+                query.append((param, str(number)))
+                urls.append(urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", urlencode(query), "")))
 
     here = canonical_url(base_url)
     return [u for u in dict.fromkeys(urls) if canonical_url(u) != here]
@@ -262,6 +308,45 @@ class GenericHtmlAdapter(DirectoryAdapter):
 
     def next_page_urls(self, page: FetchedPage, ctx: AdapterContext) -> list[str]:
         return next_page_urls_from_soup(parse_html(page.text), page.final_url, ctx.max_list_pages)
+
+    def listing_records(self, page: FetchedPage, ctx: AdapterContext) -> list[RawRecord]:
+        """Use rich listing cards directly when they already carry contact details.
+
+        This is the same detector the browser uses, applied to the server-rendered
+        HTML. It avoids fetching hundreds of profile pages when the roster already
+        publishes the fields the operator wants.
+        """
+        from ..browser.extract import extract_page, suggest_mapping
+        from ..browser.structure import analyze_html
+
+        models = analyze_html(page.text, page.final_url)
+        if not models:
+            return []
+        structure = models[0]
+        mapping = suggest_mapping(structure)
+        if "agent_name" not in mapping.columns:
+            return []
+        rows = extract_page(page.text, page.final_url, structure, mapping)
+        records: list[RawRecord] = []
+        for row in rows:
+            fields = {key: value for key, value in row.items() if not key.startswith("_")}
+            if not fields.get("agent_name"):
+                continue
+            records.append(RawRecord(
+                fields=fields,
+                profile_url=fields.get("profile_url", ""),
+                source_url=canonical_url(page.final_url),
+                method="generic-listing",
+            ))
+        # A blog index also repeats title-shaped cards. Only treat the page as a
+        # record source when the cards carry a business/contact signal; otherwise
+        # fall back to profile pages, which the roster path handles correctly.
+        meaningful = [
+            record for record in records
+            if any((record.fields or {}).get(key) for key in
+                   ("phone", "email", "brokerage_name", "street_address", "city", "website"))
+        ]
+        return meaningful if len(meaningful) >= 2 else []
 
     def parse_profile(self, page: FetchedPage, ctx: AdapterContext) -> RawRecord | None:
         return heuristic_profile(parse_html(page.text), page.final_url)

@@ -107,8 +107,9 @@ def _render_url_and_inspection() -> None:
             st.session_state["x_inspection"] = report
         except RobotsDisallowed as exc:
             st.error(
-                f"robots.txt on this site disallows collection at that URL. ({exc}) "
-                "Choose a page the site permits, or obtain written permission first."
+                f"robots.txt enforcement is on, and this path is disallowed. ({exc}) "
+                "Set B2B_ROBOTS_POLICY=warn to review the restriction instead of blocking, "
+                "or choose a page the site permits."
             )
         except BlockedError as exc:
             st.error(
@@ -210,8 +211,9 @@ def _render_run_controls(report, selected_fields: list[str]) -> None:
         st.markdown('<p class="sec-eyebrow">Step 4</p>', unsafe_allow_html=True)
         st.markdown('<p class="sec-title"><span class="stepnum">4</span>Run extraction</p>', unsafe_allow_html=True)
         st.markdown(
-            f'<p class="sec-sub">Requests are spaced {SETTINGS.request_delay_seconds:g}s apart, robots.txt is '
-            f'honoured, and no login-walled or CAPTCHA-protected content is touched. '
+            f'<p class="sec-sub">Requests are spaced {SETTINGS.request_delay_seconds:g}s apart. '
+            "robots.txt status is reported; set B2B_ROBOTS_POLICY=enforce to block automatically. "
+            "No login-walled or CAPTCHA-protected content is touched. "
             f'Up to {SETTINGS.max_profiles} profiles per run.</p>',
             unsafe_allow_html=True,
         )
@@ -224,7 +226,12 @@ def _render_run_controls(report, selected_fields: list[str]) -> None:
             "Maximum profiles", min_value=1, max_value=SETTINGS.max_profiles_per_run_hard_cap,
             key="x_profiles_input",
         )
-        run_clicked = r3.button(
+        prefer_listing = r3.checkbox(
+            "Use complete listing cards (faster; may skip profile-only fields)",
+            value=bool(SETTINGS.prefer_listing_records),
+            key="x_prefer_listing",
+        )
+        run_clicked = st.button(
             "⚡ Start extraction", type="primary", use_container_width=True,
             disabled=not selected_fields, key="x_run_button",
         )
@@ -249,6 +256,7 @@ def _render_run_controls(report, selected_fields: list[str]) -> None:
                 max_list_pages=int(pages),
                 max_profiles=int(profiles),
                 progress=on_progress,
+                prefer_listing_records=bool(prefer_listing),
             )
         except (RobotsDisallowed, BlockedError) as exc:
             progress.empty()

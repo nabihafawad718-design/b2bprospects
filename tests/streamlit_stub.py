@@ -161,6 +161,13 @@ def select_slider(label, *, options, value=None, key=None, help=None):
     return value if value is not None else list(options)[0]
 
 
+def multiselect(label, options, *, default=None, key=None, format_func=None,
+                help=None, label_visibility="visible"):
+    if key and key in session_state:
+        return list(session_state[key])
+    return list(default or [])
+
+
 def button(label, *, type="secondary", use_container_width=False, key=None,
            disabled=False, help=None):
     rendered.append(("button", str(label)))

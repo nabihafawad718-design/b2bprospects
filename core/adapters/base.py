@@ -67,6 +67,15 @@ class DirectoryAdapter:
     def profile_links(self, page: FetchedPage, ctx: AdapterContext) -> list[str]:
         return []
 
+    def listing_records(self, page: FetchedPage, ctx: AdapterContext) -> list[RawRecord]:
+        """Records available directly on the listing page, if the site publishes them.
+
+        A directory that embeds complete Person objects in schema.org or in a
+        selector-driven config can skip the per-profile fetch entirely. Returning
+        an empty list means "use profile links as usual".
+        """
+        return []
+
     # -- profile ------------------------------------------------------------
     def parse_profile(self, page: FetchedPage, ctx: AdapterContext) -> RawRecord | None:
         raise NotImplementedError

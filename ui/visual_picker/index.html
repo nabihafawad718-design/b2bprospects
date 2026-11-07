@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: light;
+    --ink: #1f2440;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --accent: #5b2fd6;
+    --accent-soft: rgba(91, 47, 214, .09);
+    --ok: #10b981;
+    --amber: #f59e0b;
+    --bg: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); font-family: Inter, "Segoe UI", system-ui, sans-serif; }
+  #toolbar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 8px 10px; border: 1px solid var(--line); border-bottom: 0;
+    border-radius: 10px 10px 0 0; background: #faf9ff;
+  }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600;
+    color: var(--accent); background: var(--accent-soft); border: 1px solid rgba(91,47,214,.22);
+    padding: 4px 9px; border-radius: 999px; white-space: nowrap;
+  }
+  #status { flex: 1 1 260px; font-size: 12.5px; color: var(--ink); min-width: 180px; }
+  #status b { color: var(--accent); }
+  button {
+    font: inherit; font-size: 12px; font-weight: 600; color: var(--ink);
+    background: #fff; border: 1px solid var(--line); border-radius: 8px;
+    padding: 6px 10px; cursor: pointer;
+  }
+  button:hover { border-color: #c9c3ea; background: #fbfaff; }
+  button.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+  #frame-wrap {
+    border: 1px solid var(--line); border-radius: 0 0 10px 10px; overflow: hidden;
+    background: #fff;
+  }
+  #preview { display: block; width: 100%; height: 540px; border: 0; background: #fff; }
+  #empty {
+    display: none; padding: 28px; color: var(--muted); font-size: 13px; text-align: center;
+  }
+  .legend { display: inline-flex; gap: 12px; align-items: center; font-size: 11.5px; color: var(--muted); }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; vertical-align: -1px; }
+</style>
+</head>
+<body>
+  <div id="toolbar">
+    <span class="pill">Click to select</span>
+    <span id="status">Click the value you want to map — for example one agent's name.</span>
+    <span class="legend">
+      <span><i class="swatch" style="background:#7c3aed"></i>hover</span>
+      <span><i class="swatch" style="background:#10b981"></i>repeated rows</span>
+    </span>
+    <button id="toggle" type="button">Pause picking</button>
+    <button id="reset" type="button">Clear</button>
+  </div>
+  <div id="frame-wrap">
+    <iframe id="preview" sandbox="allow-same-origin" referrerpolicy="no-referrer"></iframe>
+    <div id="empty">The snapshot could not be displayed.</div>
+  </div>
+
+<script>
+(() => {
+  const STATUS = document.getElementById("status");
+  const TOGGLE = document.getElementById("toggle");
+  const RESET = document.getElementById("reset");
+  const FRAME = document.getElementById("preview");
+  const EMPTY = document.getElementById("empty");
+
+  let args = {};
+  let active = true;
+  let hovered = null;
+  let loadedNonce = null;
+  let selected = null;
+  let doc = null;
+
+  const SKIP = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "HTML", "HEAD", "BODY", "LINK", "META"]);
+  const STATE_CLASS = /^(odd|even|first|last|active|selected|current|hover|focus|open|closed|is-[\w-]+|has-[\w-]+|row-\d+|item-\d+|col-\d+|index-\d+|\d+)$/i;
+
+  function send(message) {
+    try { window.parent.postMessage(Object.assign({ isStreamlitMessage: true }, message), "*"); }
+    catch (e) { /* ignore */ }
+  }
+  function setValue(value) {
+    send({ type: "streamlit:setComponentValue", value: value, dataType: "json" });
+  }
+  function setHeight(height) {
+    send({ type: "streamlit:setFrameHeight", height: height });
+  }
+
+  function clean(text) {
+    return String(text || "").replace(/\s+/g, " ").trim();
+  }
+
+  function stableClasses(el) {
+    return Array.from(el.classList || []).filter(c => c && !STATE_CLASS.test(c)).sort();
+  }
+
+  function shape(el) {
+    return el.tagName + "|" + stableClasses(el).join(".");
+  }
+
+  function cssPath(el) {
+    if (!el || el.nodeType !== 1) return "";
+    if (el.id) return "#" + CSS.escape(el.id);
+    const parts = [];
+    let node = el;
+    let guard = 0;
+    while (node && node.nodeType === 1 && node !== doc.body && guard < 8) {
+      let part = node.tagName.toLowerCase();
+      const classes = stableClasses(node).slice(0, 2);
+      if (classes.length) part += "." + classes.map(c => CSS.escape(c)).join(".");
+      const parent = node.parentElement;
+      if (parent) {
+        const siblings = Array.from(parent.children).filter(c => c.tagName === node.tagName);
+        if (siblings.length > 1) part += ":nth-of-type(" + (siblings.indexOf(node) + 1) + ")";
+      }
+      parts.unshift(part);
+      node = node.parentElement;
+      guard += 1;
+    }
+    return parts.join(" > ");
+  }
+
+  function isHidden(el) {
+    try {
+      const style = doc.defaultView.getComputedStyle(el);
+      return style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0;
+    } catch (e) { return false; }
+  }
+
+  // The closest ancestor that repeats with siblings of the same shape.
+  function findRow(el) {
+    // In a table, the record is the <tr>, never the <td>.
+    if (el && el.closest) {
+      const tableRow = el.closest("tr");
+      if (tableRow && tableRow.parentElement) {
+        const peers = Array.from(tableRow.parentElement.children).filter(
+          c => c.tagName === "TR" && !isHidden(c)
+        );
+        if (peers.length >= 2) {
+          return { row: tableRow, peers, parent: tableRow.parentElement };
+        }
+      }
+    }
+    let node = el;
+    let fallback = null;
+    for (let depth = 0; depth < 10 && node && node.parentElement && node !== doc.body; depth++) {
+      const parent = node.parentElement;
+      const signature = shape(node);
+      const peers = Array.from(parent.children).filter(c => shape(c) === signature && !isHidden(c));
+      if (peers.length >= 3) return { row: node, peers, parent };
+      if (peers.length >= 2 && !fallback) fallback = { row: node, peers, parent };
+      node = parent;
+    }
+
+    // Unique per-card classes defeat shape grouping. Group by tag for ancestors
+    // whose siblings have their own children (cards, not inline text spans).
+    node = el;
+    for (let depth = 0; depth < 10 && node && node.parentElement && node !== doc.body; depth++) {
+      const parent = node.parentElement;
+      const peers = Array.from(parent.children).filter(
+        c => c.tagName === node.tagName && !isHidden(c) && c.children.length >= 1
+      );
+      if (peers.length >= 3) return { row: node, peers, parent };
+      node = parent;
+    }
+    return fallback;
+  }
+
+  function pathIn(row, element) {
+    if (!row || !element || row === element) return "";
+    const parts = [];
+    let current = element;
+    let guard = 0;
+    while (current && current !== row && guard < 12) {
+      const parent = current.parentElement;
+      if (!parent) break;
+      const siblings = Array.from(parent.children);
+      parts.unshift(String(siblings.indexOf(current)));
+      current = parent;
+      guard += 1;
+    }
+    return current === row ? parts.join(".") : "";
+  }
+
+  function clearHighlight() {
+    if (!doc) return;
+    doc.querySelectorAll(".__b2b_hover, .__b2b_row, .__b2b_selected").forEach(el => {
+      el.classList.remove("__b2b_hover", "__b2b_row", "__b2b_selected");
+    });
+  }
+
+  function highlightRow(group, selectedElement) {
+    if (!group) return;
+    group.peers.forEach(peer => peer.classList.add("__b2b_row"));
+    if (selectedElement) selectedElement.classList.add("__b2b_selected");
+  }
+
+  function hideOverlays() {
+    if (!doc) return;
+    const viewportWidth = doc.documentElement.clientWidth || 1200;
+    const viewportHeight = doc.documentElement.clientHeight || 800;
+    let count = 0;
+    const nodes = Array.from(doc.querySelectorAll("body *")).slice(0, 4000);
+    for (const el of nodes) {
+      if (count >= 24) break;
+      const classes = ((el.className || "") + " " + (el.id || "")).toLowerCase();
+      const looksLikeOverlay = /(cookie|consent|gdpr|newsletter|popup|modal|overlay|interstitial|banner|subscribe)/.test(classes);
+      try {
+        const style = doc.defaultView.getComputedStyle(el);
+        if (style.position !== "fixed" && style.position !== "sticky") continue;
+        const rect = el.getBoundingClientRect();
+        const covers = rect.width > viewportWidth * 0.45 && rect.height > viewportHeight * 0.25;
+        const z = Number(style.zIndex) || 0;
+        if (looksLikeOverlay || (covers && z >= 50)) {
+          el.classList.add("__b2b_hidden");
+          count += 1;
+        }
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  function install() {
+    doc = FRAME.contentDocument;
+    if (!doc) {
+      EMPTY.style.display = "block";
+      STATUS.textContent = "The snapshot is not inspectable in this browser.";
+      return;
+    }
+    EMPTY.style.display = "none";
+    if (doc.__b2bInstalled) {
+      return;
+    }
+    doc.__b2bInstalled = true;
+
+    const style = doc.createElement("style");
+    style.id = "__b2b_style";
+    style.textContent = `
+      .__b2b_hover { outline: 3px solid #7c3aed !important; outline-offset: 1px !important;
+        background-color: rgba(124,58,237,.08) !important; cursor: crosshair !important; }
+      .__b2b_row { outline: 2px dashed #10b981 !important; outline-offset: 2px !important; }
+      .__b2b_selected { outline: 3px solid #f59e0b !important; outline-offset: 1px !important; }
+      .__b2b_hidden { display: none !important; }
+      html, body { overflow: auto !important; }
+    `;
+    try { doc.head.appendChild(style); } catch (e) { doc.documentElement.appendChild(style); }
+
+    hideOverlays();
+
+    doc.addEventListener("mousemove", onMove, true);
+    doc.addEventListener("click", onClick, true);
+    doc.addEventListener("mouseleave", () => { if (doc) clearHighlight(); }, true);
+    STATUS.innerHTML = "Click the value you want to map — for example one agent's <b>name</b>.";
+  }
+
+  function onMove(event) {
+    if (!active) return;
+    const target = event.target;
+    if (!target || target.nodeType !== 1 || SKIP.has(target.tagName)) return;
+    if (target === hovered) return;
+    clearHighlight();
+    hovered = target;
+    target.classList.add("__b2b_hover");
+    const group = findRow(target);
+    if (group) {
+      group.peers.forEach(peer => peer.classList.add("__b2b_row"));
+    }
+  }
+
+  function onClick(event) {
+    if (!active) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const target = event.target;
+    if (!target || target.nodeType !== 1) return;
+
+    const group = findRow(target);
+    const row = group ? group.row : target;
+    const path = pathIn(row, target);
+    const text = clean(target.innerText || target.textContent || "").slice(0, 240);
+
+    clearHighlight();
+    highlightRow(group, target);
+    selected = { target, row, group };
+
+    const value = {
+      seq: Date.now() + Math.random(),
+      nonce: args.nonce || "",
+      field: args.field || "",
+      field_label: args.field_label || "",
+      path: path,
+      text: text,
+      tag: target.tagName.toLowerCase(),
+      selector: cssPath(target),
+      row_selector: cssPath(row),
+      group_count: group ? group.peers.length : 0,
+      row_text: clean(row.innerText || row.textContent || "").slice(0, 320)
+    };
+    setValue(value);
+    active = false;
+    TOGGLE.textContent = "Resume picking";
+    STATUS.innerHTML = "Selected <b>" + (text ? text.slice(0, 70) : target.tagName.toLowerCase()) +
+      "</b>" + (group ? " · " + group.peers.length + " similar rows" : "") +
+      ". Apply it to the field on the left, or resume picking.";
+  }
+
+  TOGGLE.addEventListener("click", () => {
+    active = !active;
+    TOGGLE.textContent = active ? "Pause picking" : "Resume picking";
+    STATUS.textContent = active ? "Picking is on. Hover the page and click a value." : "Picking paused.";
+  });
+
+  RESET.addEventListener("click", () => {
+    clearHighlight();
+    selected = null;
+    active = true;
+    TOGGLE.textContent = "Pause picking";
+    setValue({ seq: Date.now() + Math.random(), nonce: args.nonce || "", reset: true });
+    STATUS.textContent = "Selection cleared. Click any value to map it.";
+  });
+
+  function render(newArgs) {
+    args = newArgs || {};
+    const html = args.html || "";
+    if (!html) {
+      FRAME.style.display = "none";
+      EMPTY.style.display = "block";
+      EMPTY.textContent = "No rendered page snapshot was supplied.";
+      return;
+    }
+    FRAME.style.display = "block";
+    const nonce = String(args.nonce || "snapshot");
+    if (loadedNonce !== nonce) {
+      loadedNonce = nonce;
+      FRAME.addEventListener("load", install, { once: true });
+      FRAME.srcdoc = html;
+    } else if (doc) {
+      install();
+    }
+    active = true;
+    TOGGLE.textContent = "Pause picking";
+    setHeight(640);
+  }
+
+  window.addEventListener("message", event => {
+    const data = event.data;
+    if (!data || data.type !== "streamlit:render") return;
+    render(data.args || {});
+  });
+
+  send({ type: "streamlit:componentReady", apiVersion: 1 });
+  setHeight(640);
+  window.addEventListener("resize", () => setHeight(640));
+})();
+</script>
+</body>
+</html>

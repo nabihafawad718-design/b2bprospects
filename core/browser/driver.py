@@ -16,13 +16,17 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from ..net import PoliteFetcher
+from ..net import PoliteFetcher, UnsafeURLError, assert_public_url
 from ..settings import SETTINGS, Settings
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+# Short wait used by wait_for_rows; defined here so the driver has no pagination
+# import cycle.
+POLL_MS = 300
 
 _BLOCK_TITLES = re.compile(
     r"(just a moment|attention required|access denied|are you a robot|security check|"
@@ -75,6 +79,8 @@ class RenderedPage:
     html: str
     blocked: bool = False
     block_reason: str = ""
+    robots_allowed: bool = True
+    robots_detail: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
 
 
@@ -128,25 +134,35 @@ class PlaywrightSession:
     def __init__(
         self,
         settings: Settings = SETTINGS,
-        headless: bool = True,
+        headless: bool | None = None,
         respect_robots: bool | None = None,
-        nav_timeout_ms: int = 30_000,
-        idle_timeout_ms: int = 8_000,
+        nav_timeout_ms: int | None = None,
+        idle_timeout_ms: int | None = None,
         user_agent: str = DEFAULT_USER_AGENT,
         robots_fetcher: PoliteFetcher | None = None,
+        block_media: bool | None = None,
+        reveal_contacts: bool | None = None,
     ) -> None:
         self.settings = settings
-        self.headless = headless
-        self.respect_robots = settings.respect_robots_txt if respect_robots is None else respect_robots
-        self.nav_timeout_ms = nav_timeout_ms
-        self.idle_timeout_ms = idle_timeout_ms
+        self.headless = settings.browser_headless if headless is None else headless
+        self.respect_robots = settings.robots_enforced if respect_robots is None else respect_robots
+        self.nav_timeout_ms = nav_timeout_ms or settings.browser_nav_timeout_ms
+        self.idle_timeout_ms = idle_timeout_ms or settings.browser_idle_timeout_ms
         self.user_agent = user_agent
-        self._robots_fetcher = robots_fetcher
+        self.block_media = settings.browser_block_media if block_media is None else block_media
+        self.reveal_contacts_enabled = (
+            settings.browser_reveal_contacts if reveal_contacts is None else reveal_contacts
+        )
+        # One fetcher per session so robots.txt is cached per host instead of being
+        # downloaded again for every profile page.
+        self._robots_fetcher = robots_fetcher or PoliteFetcher(settings)
         self._pw = None
         self._browser = None
         self._context = None
         self._page = None
         self.pages_opened = 0
+        self.last_robots_allowed = True
+        self.last_robots_detail = ""
 
     # -- lifecycle ----------------------------------------------------------
     def __enter__(self) -> "PlaywrightSession":
@@ -171,9 +187,28 @@ class PlaywrightSession:
                 viewport={"width": 1440, "height": 900},
                 locale="en-US",
                 java_script_enabled=True,
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
             )
             self._page = self._context.new_page()
             self._page.set_default_timeout(self.nav_timeout_ms)
+            try:
+                self._page.set_default_navigation_timeout(self.nav_timeout_ms)
+            except Exception:
+                pass
+            try:
+                self._page.on("dialog", lambda dialog: dialog.dismiss())
+            except Exception:
+                pass
+            if self.block_media:
+                try:
+                    self._page.route(
+                        "**/*",
+                        lambda route: route.abort()
+                        if route.request.resource_type in {"image", "media", "font"}
+                        else route.continue_(),
+                    )
+                except Exception:
+                    pass
         except BrowserUnavailable:
             raise
         except Exception as exc:
@@ -195,22 +230,31 @@ class PlaywrightSession:
         self._pw = self._browser = self._context = self._page = None
 
     # -- robots -------------------------------------------------------------
-    def _check_robots(self, url: str) -> None:
-        if not self.respect_robots:
-            return
-        fetcher = self._robots_fetcher or PoliteFetcher(self.settings)
+    def _check_robots(self, url: str) -> tuple[bool, str]:
+        """Return (allowed, detail). Only enforce when the operator asked us to."""
+        if self.settings.robots_silent:
+            return True, "robots.txt not checked (policy: ignore)"
+        fetcher = self._robots_fetcher
         allowed, detail = fetcher.can_fetch(url)
-        if not allowed:
+        if not allowed and self.respect_robots:
             raise BrowserBlocked(
                 f"robots.txt on {url} disallows automated access ({detail}). "
-                "Choose a permitted page or obtain written permission from the site owner."
+                "Choose a permitted page, set B2B_ROBOTS_POLICY=warn to review the "
+                "restriction, or obtain written permission from the site owner."
             )
+        return allowed, detail
 
     # -- navigation ---------------------------------------------------------
     def open(self, url: str) -> RenderedPage:
         if self._page is None:
             self.start()
-        self._check_robots(url)
+        try:
+            assert_public_url(url, allow_local=self.settings.allow_local_urls)
+        except UnsafeURLError as exc:
+            raise BrowserError(str(exc)) from exc
+        allowed, detail = self._check_robots(url)
+        self.last_robots_allowed = allowed
+        self.last_robots_detail = detail
 
         try:
             response = self._page.goto(url, wait_until="domcontentloaded", timeout=self.nav_timeout_ms)
@@ -219,6 +263,10 @@ class PlaywrightSession:
 
         self.pages_opened += 1
         status = int(getattr(response, "status", 0) or 0) if response is not None else 0
+        try:
+            assert_public_url(self._page.url, allow_local=self.settings.allow_local_urls)
+        except UnsafeURLError as exc:
+            raise BrowserError(str(exc)) from exc
 
         # Give client-side rendering time, but never wait forever on a page that
         # keeps polling.
@@ -237,6 +285,8 @@ class PlaywrightSession:
             title=title,
             status=status,
             html=html,
+            robots_allowed=allowed,
+            robots_detail=detail,
         )
         self._detect_block(page)
         return page
@@ -255,11 +305,19 @@ class PlaywrightSession:
                 f"The site refused access (HTTP {page.status}). Stopping. "
                 "Do not retry in a loop; check the site's terms and your permission to collect."
             )
+        if page.status == 404:
+            raise BrowserError(f"That page was not found (HTTP 404): {page.final_url or page.url}")
         if page.status >= 500:
             raise BrowserError(f"The site returned a server error (HTTP {page.status}). Try later.")
 
-        haystack = f"{page.title}\n{page.html[:20000]}"
-        if _BLOCK_TITLES.search(page.title or "") or _BLOCK_BODY.search(haystack):
+        # Challenge detection looks at the title always, and at the body only when
+        # the page is short. A long article that merely mentions "verify you are
+        # human" must not be mistaken for an anti-bot wall.
+        visible_text = re.sub(r"<[^>]+>", " ", page.html or "")
+        visible_text = re.sub(r"\s+", " ", visible_text).strip()
+        haystack = f"{page.title}\n{visible_text[:8000]}"
+        challenge_body = _BLOCK_BODY.search(haystack) and (len(visible_text) < 15_000 or page.status == 403)
+        if _BLOCK_TITLES.search(page.title or "") or challenge_body:
             page.blocked = True
             page.block_reason = "anti-bot challenge"
             raise BrowserBlocked(
@@ -304,6 +362,7 @@ class PlaywrightSession:
     def scroll_to_bottom(self, steps: int = 10, pause_ms: int = 250) -> dict[str, Any]:
         from .js import SCROLL_BOTTOM_JS
 
+        steps = max(1, int(steps))
         last_height = -1
         stable = 0
         used = 0
@@ -319,6 +378,78 @@ class PlaywrightSession:
                 stable = 0
             last_height = height
         return {"height": last_height, "steps": used}
+
+    def auto_scroll(self, steps: int | None = None, pause_ms: int = 200) -> dict[str, Any]:
+        """Scroll through the page to trigger lazy-loaded rows, then return to top."""
+        from .js import SCROLL_TOP_JS
+
+        result = self.scroll_to_bottom(steps=steps or self.settings.browser_scroll_steps,
+                                       pause_ms=pause_ms)
+        self.evaluate(SCROLL_TOP_JS)
+        return result
+
+    def click_text(self, text: str, timeout_ms: int | None = None) -> bool:
+        """Click a control by its visible text (for pagers without stable CSS)."""
+        if self._page is None or not text:
+            return False
+        locator = None
+        try:
+            locator = self._page.get_by_text(text, exact=True).first
+        except Exception:
+            try:
+                escaped = str(text).replace('"', '\\"')
+                locator = self._page.locator(f'text="{escaped}"').first
+            except Exception:
+                return False
+        try:
+            locator.click(timeout=timeout_ms or 8_000)
+            self._settle()
+            return True
+        except Exception:
+            return False
+
+    def reveal_contacts(self) -> int:
+        """Click ordinary 'show phone/email' controls so rendered contacts appear."""
+        if not self.reveal_contacts_enabled or self._page is None:
+            return 0
+        from .js import REVEAL_CONTACT_JS
+
+        clicked = self.evaluate(REVEAL_CONTACT_JS)
+        try:
+            clicked = int(clicked or 0)
+        except (TypeError, ValueError):
+            clicked = 0
+        if clicked:
+            self.wait(600)
+        return clicked
+
+    def count_rows(self, selector: str) -> int:
+        from .js import COUNT_ROWS_JS
+
+        try:
+            return int(self.evaluate(COUNT_ROWS_JS, selector) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def wait_for_rows(self, selector: str, min_count: int = 1, timeout_ms: int = 8_000) -> int:
+        waited = 0
+        count = 0
+        while waited < timeout_ms:
+            count = self.count_rows(selector)
+            if count >= min_count:
+                return count
+            self.wait(POLL_MS)
+            waited += POLL_MS
+        return count
+
+    def screenshot(self, path: str) -> bool:
+        if self._page is None:
+            return False
+        try:
+            self._page.screenshot(path=path, full_page=True)
+            return True
+        except Exception:
+            return False
 
     def wait(self, ms: int) -> None:
         try:
@@ -358,4 +489,6 @@ class PlaywrightSession:
             return BrowserError("That address could not be resolved. Check the URL for typos.")
         if "ERR_CONNECTION" in message:
             return BrowserError("The site refused the connection.")
+        if "ERR_ABORTED" in message:
+            return BrowserError("The navigation was aborted by the site or a redirect loop.")
         return BrowserError(f"Could not open the page: {name}: {message}")

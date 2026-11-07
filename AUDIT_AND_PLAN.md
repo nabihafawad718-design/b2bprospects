@@ -1,6 +1,6 @@
-> **Phase 2 note:** the browser engine added after this audit is documented in
-> `docs/BROWSER_ENGINE.md` and `docs/PHASE2_AUDIT.md`. This file remains the
-> Phase 1 audit and technical plan.
+> **Historical note:** this is the Phase 1 audit and plan. The browser engine is
+> documented in `docs/BROWSER_ENGINE.md`; the v3 implementation and testing record
+> is `docs/V3_CHANGES.md`.
 
 # B2BProspects — Stage 1 Audit & Stage 2 Technical Plan
 

@@ -33,6 +33,7 @@ FIELD_CATALOGUE: tuple[FieldSpec, ...] = (
     FieldSpec("city", "City", "City from the listed office address.", core=True),
     FieldSpec("state", "State / region", "State or region code from the listed address.", core=True),
     FieldSpec("postal_code", "Postal code", "Postal or ZIP code from the listed address.", core=False),
+    FieldSpec("country", "Country", "Country from the listed address, when published.", core=False),
     FieldSpec("website", "Website", "Public website listed for the agent or office.", core=False),
     FieldSpec("profile_url", "Profile URL", "Canonical URL of the source profile page.", core=True),
     FieldSpec("source_url", "Source URL", "Directory page the record was collected from.", core=True),
@@ -50,6 +51,20 @@ EXPORT_HEADERS: dict[str, str] = {f.key: f.label for f in FIELD_CATALOGUE} | {
     "adapter_id": "Adapter",
     "quality_flags": "Quality flags",
 }
+
+
+def pretty_key(key: str) -> str:
+    """Turn a user-named extra field into a readable column header."""
+    text = str(key or "").replace("_", " ").replace("-", " ").strip()
+    if not text:
+        return "Field"
+    if text.islower() or text.isupper():
+        return text.title()
+    return text
+
+
+def header_for(key: str) -> str:
+    return EXPORT_HEADERS.get(key) or pretty_key(key)
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +96,7 @@ class Record:
     city: str = ""
     state: str = ""
     postal_code: str = ""
+    country: str = ""
     website: str = ""
     profile_url: str = ""
     source_url: str = ""
@@ -90,9 +106,13 @@ class Record:
     quality_flags: list[str] = field(default_factory=list)
     duplicate_of: str = ""
     phone_digits: str = ""      # internal, used for matching; not exported
+    # Arbitrary columns the operator chose to keep (title, licence number, ...).
+    extra: dict[str, str] = field(default_factory=dict)
 
     def to_row(self) -> dict[str, Any]:
         row = {k: getattr(self, k) for k in FIELD_KEYS}
+        for key, value in (self.extra or {}).items():
+            row.setdefault(str(key), value)
         row["collected_at"] = self.collected_at
         row["extraction_method"] = self.extraction_method
         row["adapter_id"] = self.adapter_id
@@ -212,6 +232,13 @@ class BrowserInspection:
     candidates: list[StructureModel] = field(default_factory=list)
     jsonld_types: list[str] = field(default_factory=list)
     embedded_keys: list[str] = field(default_factory=list)
+    embedded_record_count: int = 0
+    embedded_payloads: list[str] = field(default_factory=list)
+    profile_link_count: int = 0
+    available_fields: list[str] = field(default_factory=list)
+    page_text_length: int = 0
+    robots_allowed: bool = True
+    robots_detail: str = ""
     pagination: dict[str, Any] = field(default_factory=dict)
     blocked: bool = False
     block_reason: str = ""
@@ -237,8 +264,10 @@ class QualityReport:
     duplicates_removed: int = 0
     missing_names: int = 0
     with_any_contact: int = 0
+    contact_share: float = 0.0
     success_rate: float = 0.0
     field_fill: dict[str, float] = field(default_factory=dict)
+    issue_counts: dict[str, int] = field(default_factory=dict)
     level: str = "ok"                    # ok | watch | broken
     warnings: list[str] = field(default_factory=list)
 
@@ -282,6 +311,10 @@ class RunResult:
     profiles_attempted: int = 0
     errors: list[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
+    # Free-form facts about the delivered dataset (filters applied, cleaning mode,
+    # page cap reached). Written into the Excel Run Summary and shown in the UI.
+    export_context: dict[str, str] = field(default_factory=dict)
+    screenshots: list[str] = field(default_factory=list)
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -307,6 +340,8 @@ class RunResult:
             "elapsed_seconds": round(self.elapsed_seconds, 1),
             "errors": self.errors[:20],
             "warnings": (self.inspection.warnings + self.quality.warnings + self.health.reasons)[:30],
+            "export_context": self.export_context,
+            "screenshots": self.screenshots,
         }
 
 

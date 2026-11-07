@@ -19,12 +19,14 @@ esc = html.escape
 # Original helpers
 # ---------------------------------------------------------------------------
 def metric_card(icon: str, label: str, value: str, sub: str, accent: str) -> str:
+    # Values can include page-derived text (pagination reason, payload name), so
+    # escape them rather than injecting site content into the dashboard.
     return (
-        f'<div class="mcard" style="--accent:{accent}">'
-        f'<div class="mcard-head"><span class="mcard-icon">{icon}</span>'
-        f'<span class="mcard-label">{label}</span></div>'
-        f'<div class="mcard-value">{value}</div>'
-        f'<div class="mcard-sub">{sub}</div></div>'
+        f'<div class="mcard" style="--accent:{esc(str(accent))}">'
+        f'<div class="mcard-head"><span class="mcard-icon">{esc(str(icon))}</span>'
+        f'<span class="mcard-label">{esc(str(label))}</span></div>'
+        f'<div class="mcard-value">{esc(str(value))}</div>'
+        f'<div class="mcard-sub">{esc(str(sub))}</div></div>'
     )
 
 

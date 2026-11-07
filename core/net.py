@@ -52,6 +52,8 @@ class FetchedPage:
     text: str
     headers: dict[str, str] = field(default_factory=dict)
     elapsed: float = 0.0
+    robots_allowed: bool = True
+    robots_detail: str = ""
 
     @property
     def content_type(self) -> str:
@@ -101,11 +103,18 @@ def normalize_url(raw: str) -> str:
     return clean
 
 
-def assert_public_url(url: str) -> None:
-    """Reject obvious SSRF targets. Literal IPs only — no DNS resolution here."""
+def assert_public_url(url: str, allow_local: bool = False) -> None:
+    """Reject obvious SSRF targets. Literal IPs only — no DNS resolution here.
+
+    `allow_local` exists for the bundled demo server and local integration tests.
+    It stays off by default so a pasted URL cannot reach a machine-local admin panel.
+    """
     host = (urlparse(url).hostname or "").lower()
     if not host:
         raise UnsafeURLError("URL has no host.", url)
+    # The demo server exception is loopback only, never an arbitrary LAN address.
+    if allow_local and (host == "localhost" or host == "::1" or host.startswith("127.")):
+        return
     if host in _BLOCKED_HOSTNAMES or host.endswith(".local") or host.endswith(".internal"):
         raise UnsafeURLError(f"Refusing to fetch internal host {host!r}.", url)
     try:
@@ -199,14 +208,19 @@ class PoliteFetcher:
         return parser, detail
 
     def can_fetch(self, url: str) -> tuple[bool, str]:
-        if not self.settings.respect_robots_txt:
-            return True, "robots.txt enforcement disabled in settings"
+        """Return (allowed, detail).
+
+        A robots.txt disallow is reported, not automatically fatal, unless the
+        operator selected enforcement. The caller decides how to present it.
+        """
+        if self.settings.robots_silent:
+            return True, "robots.txt not checked (policy: ignore)"
         parser, detail = self._robots_for(url)
         if parser is None:
             return True, detail
         allowed = parser.can_fetch(self.settings.user_agent, url)
         if not allowed:
-            return False, "blocked by robots.txt"
+            return False, f"{detail}; robots.txt disallows this path"
         return True, detail
 
     def robots_status(self, url: str) -> str:
@@ -229,12 +243,17 @@ class PoliteFetcher:
     # -- main ---------------------------------------------------------------
     def get(self, url: str, *, check_robots: bool = True) -> FetchedPage:
         url = normalize_url(url)
-        assert_public_url(url)
+        assert_public_url(url, allow_local=self.settings.allow_local_urls)
 
+        robots_allowed, robots_detail = True, "not checked"
         if check_robots:
-            allowed, detail = self.can_fetch(url)
-            if not allowed:
-                raise RobotsDisallowed(f"robots.txt disallows {url}", url)
+            robots_allowed, robots_detail = self.can_fetch(url)
+            if not robots_allowed and self.settings.robots_enforced:
+                raise RobotsDisallowed(
+                    f"robots.txt disallows {url} ({robots_detail}). "
+                    "Set B2B_ROBOTS_POLICY=warn to review the restriction instead of blocking.",
+                    url,
+                )
 
         headers = {
             "User-Agent": self.settings.user_agent,
@@ -276,9 +295,16 @@ class PoliteFetcher:
             if status >= 400:
                 raise FetchError(f"HTTP {status}", url, status)
 
+            # A public URL can redirect to a private address; check the final hop.
+            try:
+                assert_public_url(final_url or url, allow_local=self.settings.allow_local_urls)
+            except UnsafeURLError:
+                raise
+
             return FetchedPage(
                 url=url, final_url=final_url or url, status_code=status, text=text,
                 headers={str(k).lower(): str(v) for k, v in resp_headers.items()}, elapsed=elapsed,
+                robots_allowed=robots_allowed, robots_detail=robots_detail,
             )
 
         raise FetchError(f"Request failed: {last_exc}", url)

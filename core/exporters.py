@@ -1,30 +1,39 @@
-"""CSV and Excel export.
+"""CSV, Excel and JSON export.
 
 Every workbook carries a second sheet documenting how the data was produced:
 source, timestamp, adapter, field coverage and warnings. A customer receiving an
 export can see exactly what was and was not collected.
+
+Optional extras:
+  * `records` exports a filtered/cleaned subset without mutating the run;
+  * `include_issues` adds a third sheet listing every flagged record;
+  * `extra_keys` controls which arbitrary columns appear.
 """
 from __future__ import annotations
 
 import io
+import json
 import re
 from copy import copy
 from datetime import datetime, timezone
 
 import pandas as pd
 
-from .models import EXPORT_HEADERS, FIELD_BY_KEY, Record, RunResult
+from .cleaning import available_extra_keys, issue_rows
+from .models import FIELD_BY_KEY, Record, RunResult, header_for
 from .quality import export_columns
 
 
-def records_to_frame(records: list[Record], selected_fields: list[str]) -> pd.DataFrame:
-    columns = export_columns(selected_fields)
+def records_to_frame(records: list[Record], selected_fields: list[str],
+                     extra_keys: list[str] | None = None) -> pd.DataFrame:
+    keys = available_extra_keys(records) if extra_keys is None else list(extra_keys)
+    columns = export_columns(selected_fields, keys)
     rows = []
     for record in records:
         row = record.to_row()
         rows.append({column: row.get(column, "") for column in columns})
     frame = pd.DataFrame(rows, columns=columns)
-    return frame.rename(columns={c: EXPORT_HEADERS.get(c, c) for c in frame.columns})
+    return frame.rename(columns={c: header_for(c) for c in frame.columns})
 
 
 def safe_slug(value: str, fallback: str = "extract") -> str:
@@ -38,12 +47,21 @@ def basename_for(run: RunResult) -> str:
     return f"{safe_slug(run.adapter_id or 'extract')}_{host}_{stamp}"
 
 
-def to_csv_bytes(records: list[Record], selected_fields: list[str]) -> bytes:
-    frame = records_to_frame(records, selected_fields)
+def to_csv_bytes(records: list[Record], selected_fields: list[str],
+                 extra_keys: list[str] | None = None) -> bytes:
+    frame = records_to_frame(records, selected_fields, extra_keys)
     return frame.to_csv(index=False).encode("utf-8-sig")
 
 
-def _summary_rows(run: RunResult) -> list[tuple[str, str]]:
+def to_json_bytes(records: list[Record], selected_fields: list[str],
+                  extra_keys: list[str] | None = None, pretty: bool = True) -> bytes:
+    frame = records_to_frame(records, selected_fields, extra_keys)
+    payload = frame.to_dict(orient="records")
+    return json.dumps(payload, ensure_ascii=False, indent=2 if pretty else None).encode("utf-8")
+
+
+def _summary_rows(run: RunResult, records: list[Record],
+                  context: dict[str, str] | None = None) -> list[tuple[str, str]]:
     quality = run.quality
     health = run.health
     rows = [
@@ -54,9 +72,10 @@ def _summary_rows(run: RunResult) -> list[tuple[str, str]]:
         ("Started (UTC)", run.started_at),
         ("Finished (UTC)", run.finished_at),
         ("Duration (seconds)", f"{run.elapsed_seconds:.1f}"),
-        ("Records exported", str(quality.unique)),
+        ("Records in run", str(quality.unique)),
+        ("Records exported", str(len(records))),
         ("Profiles attempted", str(quality.attempted)),
-        ("Duplicates removed", str(quality.duplicates_removed)),
+        ("Duplicates removed by engine", str(quality.duplicates_removed)),
         ("Extraction success rate", f"{quality.success_rate:.1%}"),
         ("Records with phone or email", str(quality.with_any_contact)),
         ("Quality level", quality.level.upper()),
@@ -65,11 +84,19 @@ def _summary_rows(run: RunResult) -> list[tuple[str, str]]:
         ("Markup signature changed", "yes" if health.structure_changed else "no"),
         ("Pages fetched", str(run.pages_fetched)),
         ("Robots.txt", run.inspection.robots_detail or "not checked"),
+    ]
+    combined = {**run.export_context, **(context or {})}
+    if combined:
+        rows.append(("", ""))
+        rows.append(("Delivery / cleaning", ""))
+        rows.extend((f"  {key}", str(value)) for key, value in combined.items())
+
+    rows.extend([
         ("", ""),
         ("Field coverage", "share of exported records with a value"),
-    ]
+    ])
     for key, rate in quality.field_fill.items():
-        label = FIELD_BY_KEY[key].label if key in FIELD_BY_KEY else key
+        label = FIELD_BY_KEY[key].label if key in FIELD_BY_KEY else header_for(key)
         rows.append((f"  {label}", f"{rate:.0%}"))
 
     warnings = []
@@ -91,15 +118,26 @@ def _summary_rows(run: RunResult) -> list[tuple[str, str]]:
     return rows
 
 
-def to_excel_bytes(run: RunResult, selected_fields: list[str]) -> bytes:
+def to_excel_bytes(run: RunResult, selected_fields: list[str],
+                   extra_keys: list[str] | None = None,
+                   records: list[Record] | None = None,
+                   include_issues: bool = False,
+                   context: dict[str, str] | None = None) -> bytes:
     """Raises on failure so the caller can show a real error instead of hiding the button."""
-    frame = records_to_frame(run.records, selected_fields)
-    summary = pd.DataFrame(_summary_rows(run), columns=["Item", "Detail"])
+    exported = run.records if records is None else records
+    frame = records_to_frame(exported, selected_fields, extra_keys)
+    summary = pd.DataFrame(_summary_rows(run, exported, context), columns=["Item", "Detail"])
+    issues = issue_rows(exported) if include_issues else []
 
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         frame.to_excel(writer, index=False, sheet_name="Records")
         summary.to_excel(writer, index=False, sheet_name="Run Summary")
+        if include_issues:
+            issues_frame = pd.DataFrame(issues, columns=[
+                "Row", "Name", "Brokerage", "Phone", "Email", "Profile URL", "Issues", "Quality flags"
+            ])
+            issues_frame.to_excel(writer, index=False, sheet_name="Issues")
 
         records_sheet = writer.sheets["Records"]
         for index, column in enumerate(frame.columns, start=1):
@@ -118,4 +156,14 @@ def to_excel_bytes(run: RunResult, selected_fields: list[str]) -> bytes:
                 alignment.wrap_text = True
                 alignment.vertical = "top"
                 cell.alignment = alignment
+
+        if include_issues and "Issues" in writer.sheets:
+            issues_sheet = writer.sheets["Issues"]
+            issues_sheet.freeze_panes = "A2"
+            for index, column in enumerate(issues_frame.columns, start=1):
+                longest = issues_frame[column].astype(str).str.len().max() if len(issues_frame) else 0
+                longest = int(longest) if longest == longest else 0
+                issues_sheet.column_dimensions[issues_sheet.cell(row=1, column=index).column_letter].width = max(
+                    10, min(60, longest + 2)
+                )
     return buffer.getvalue()
