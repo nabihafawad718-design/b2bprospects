@@ -9,6 +9,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
+from core import diagnostics
 from core.cleaning import (
     DEDUPE_STRATEGIES,
     FilterSpec,
@@ -91,6 +92,45 @@ def render_quality(result) -> None:
             notes(warnings)
         if result.errors:
             notes(result.errors[:8], error=True)
+        render_diagnosis(result)
+
+
+def render_diagnosis(result) -> None:
+    """Show every extraction layer tried, and explain a failure in operator terms."""
+    diagnosis = getattr(result, "diagnosis", None)
+    if diagnosis is None or not getattr(diagnosis, "attempts", None):
+        return
+    failed = bool(diagnosis.failure_code) and not diagnosis.ok
+    if failed:
+        st.error(
+            f"{diagnostics.label(diagnosis.failure_code)}: {diagnosis.summary or 'No records were produced.'}"
+        )
+        if diagnosis.recommendations:
+            st.markdown("**What to try next**")
+            for item in diagnosis.recommendations:
+                st.markdown(f"- {item}")
+    with st.expander(
+        f"Extraction methods tried ({len(diagnosis.attempts)})",
+        expanded=failed,
+    ):
+        rows = [
+            {
+                "Method": attempt.label,
+                "Result": attempt.status,
+                "Records": attempt.records,
+                "Detail": attempt.detail,
+                "Seconds": attempt.seconds,
+            }
+            for attempt in diagnosis.attempts
+        ]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if diagnosis.ok:
+            st.caption(f"Delivered using: {diagnosis.selected_label or diagnosis.selected_method}")
+        if diagnosis.blocked:
+            st.caption(
+                "The run stopped on an explicit access refusal. Do not retry in a loop or try "
+                "to work around it."
+            )
 
 
 # ---------------------------------------------------------------------------

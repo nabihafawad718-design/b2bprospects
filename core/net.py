@@ -6,6 +6,7 @@ fail loudly rather than silently truncate, and be trivially testable offline.
 from __future__ import annotations
 
 import ipaddress
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
@@ -84,6 +85,32 @@ _PRIVATE_NETWORKS = (
 )
 
 _BLOCKED_HOSTNAMES = {"localhost", "localhost.localdomain", "metadata.google.internal"}
+
+# Clear anti-bot wall markers. A long article that merely discusses these phrases
+# must not be treated as a challenge, so the body check is limited to short pages.
+_CHALLENGE_TITLE = re.compile(
+    r"(just a moment|attention required|access denied|are you a robot|security check|"
+    r"pardon our interruption|request blocked|too many requests)",
+    re.I,
+)
+_CHALLENGE_BODY = re.compile(
+    r"(verify you are human|checking your browser|enable javascript and cookies to continue|"
+    r"unusual traffic from your computer|cf-error-details|cf-browser-verification|"
+    r"please complete the security check|ddos protection by)",
+    re.I,
+)
+
+
+def _looks_like_challenge(text: str) -> bool:
+    if not text:
+        return False
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", text[:20_000], re.I | re.S)
+    title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else ""
+    if title and _CHALLENGE_TITLE.search(title):
+        return True
+    visible = re.sub(r"<[^>]+>", " ", text)
+    visible = re.sub(r"\s+", " ", visible).strip()
+    return bool(len(visible) < 15_000 and _CHALLENGE_BODY.search(visible))
 
 
 def normalize_url(raw: str) -> str:
@@ -281,11 +308,12 @@ class PoliteFetcher:
             self.hosts_contacted.add((urlparse(final_url or url).hostname or "").lower())
 
             if status in (401, 403, 429):
-                if attempt < self.settings.max_retries:
-                    self._sleep(2.0 * (attempt + 1))
-                    continue
+                # Explicit refusal: stop immediately. Retrying is both ineffective
+                # and exactly the behaviour the operator must avoid.
                 raise BlockedError(
-                    f"Site refused access (HTTP {status}). Stop — do not retry or work around this.", url, status
+                    f"Site refused access (HTTP {status}). Stop — do not retry or work around this.",
+                    url,
+                    status,
                 )
             if status in (500, 502, 503, 504):
                 if attempt < self.settings.max_retries:
@@ -300,6 +328,16 @@ class PoliteFetcher:
                 assert_public_url(final_url or url, allow_local=self.settings.allow_local_urls)
             except UnsafeURLError:
                 raise
+
+            # A 200 response can still be an anti-bot wall. Treat it as an explicit
+            # refusal, not as an empty layout, so the operator does not keep trying.
+            if _looks_like_challenge(text):
+                raise BlockedError(
+                    "The site served an anti-bot challenge or access-denied page. "
+                    "This tool does not bypass those protections.",
+                    url,
+                    status,
+                )
 
             return FetchedPage(
                 url=url, final_url=final_url or url, status_code=status, text=text,

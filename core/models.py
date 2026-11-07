@@ -149,6 +149,10 @@ class InspectionReport:
     profile_link_samples: list[str] = field(default_factory=list)
     profile_link_pattern: str = ""
 
+    # embedded JSON payloads
+    embedded_record_count: int = 0
+    embedded_payloads: list[str] = field(default_factory=list)
+
     # navigation
     pagination_type: str = "none"       # next_link | numbered | query_param | none
     pagination_pages: int = 0
@@ -156,10 +160,13 @@ class InspectionReport:
     load_more_detected: bool = False
     sitemap_found: bool = False
 
-    # capability
+    # capability / preview
     requires_javascript: bool = False
     estimated_records: int = 0
     available_fields: list[str] = field(default_factory=list)
+    suggested_fields: dict[str, str] = field(default_factory=dict)
+    sample_records: list[dict[str, Any]] = field(default_factory=list)
+    detected_layers: list[str] = field(default_factory=list)
     recommended_adapter: str = ""
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -185,8 +192,9 @@ class ColumnProfile:
     sample_values: list[str] = field(default_factory=list)
     fill_rate: float = 0.0
     href_rate: float = 0.0
-    kind_hint: str = "unknown"          # name|phone|email|address|city|state|postal|url|text
+    kind_hint: str = "unknown"          # name|first_name|last_name|phone|email|address|city|state|postal|title|url|text
     label: str = ""
+    header: str = ""                    # table header or nearby label, when one was found
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -203,7 +211,8 @@ class StructureModel:
     signature: str = ""
     heading: str = ""
     score: float = 0.0
-    method: str = "browser-dom"
+    method: str = "browser-dom"          # browser-dom | link-cluster
+    headers: list[str] = field(default_factory=list)
 
     def column(self, index: int | None) -> ColumnProfile | None:
         if index is None:
@@ -231,11 +240,16 @@ class BrowserInspection:
     structure: StructureModel | None = None
     candidates: list[StructureModel] = field(default_factory=list)
     jsonld_types: list[str] = field(default_factory=list)
+    jsonld_record_count: int = 0
     embedded_keys: list[str] = field(default_factory=list)
     embedded_record_count: int = 0
     embedded_payloads: list[str] = field(default_factory=list)
+    link_cluster_count: int = 0
     profile_link_count: int = 0
     available_fields: list[str] = field(default_factory=list)
+    suggested_mapping: dict[str, int] = field(default_factory=dict)
+    sample_records: list[dict[str, Any]] = field(default_factory=list)
+    detected_layers: list[str] = field(default_factory=list)
     page_text_length: int = 0
     robots_allowed: bool = True
     robots_detail: str = ""
@@ -292,6 +306,56 @@ class HealthReport:
 
 
 # ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+@dataclass
+class MethodAttempt:
+    """One extraction strategy that was tried, and the honest outcome."""
+
+    method: str
+    label: str
+    status: str = "pending"             # ok | empty | failed | skipped
+    records: int = 0
+    detail: str = ""
+    seconds: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ExtractionDiagnosis:
+    """Why a run used the method it did, or why it produced nothing.
+
+    The UI shows this verbatim so an operator can tell the difference between
+    "the site refused access", "the page is JavaScript-only", "the mapping is
+    wrong" and "the pagination stalled".
+    """
+
+    attempts: list[MethodAttempt] = field(default_factory=list)
+    selected_method: str = ""
+    selected_label: str = ""
+    failure_code: str = ""              # see core.diagnostics.CODES
+    summary: str = ""
+    recommendations: list[str] = field(default_factory=list)
+    blocked: bool = False
+    blocked_reason: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.selected_method) and not self.failure_code
+
+    def add(self, method: str, label: str, status: str, records: int = 0,
+            detail: str = "", seconds: float = 0.0) -> MethodAttempt:
+        attempt = MethodAttempt(method, label, status, records, detail, round(seconds, 2))
+        self.attempts.append(attempt)
+        return attempt
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 @dataclass
@@ -307,6 +371,7 @@ class RunResult:
     records: list[Record] = field(default_factory=list)
     quality: QualityReport = field(default_factory=QualityReport)
     health: HealthReport = field(default_factory=HealthReport)
+    diagnosis: ExtractionDiagnosis = field(default_factory=ExtractionDiagnosis)
     pages_fetched: int = 0
     profiles_attempted: int = 0
     errors: list[str] = field(default_factory=list)
@@ -342,6 +407,7 @@ class RunResult:
             "warnings": (self.inspection.warnings + self.quality.warnings + self.health.reasons)[:30],
             "export_context": self.export_context,
             "screenshots": self.screenshots,
+            "diagnosis": self.diagnosis.to_dict() if self.diagnosis.attempts else {},
         }
 
 

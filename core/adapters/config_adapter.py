@@ -187,9 +187,11 @@ class ConfigSiteAdapter(DirectoryAdapter):
                 target = canonical_url(urljoin(page.final_url, str(anchor["href"])))
                 if target and target != canonical_url(page.final_url):
                     return [target]
-            # A configured next control that is absent means we are on the last
-            # page. Do not invent further page URLs in that case.
-            return []
+            # The configured selector matched nothing. That usually means the last
+            # page, but it can also mean the site changed its markup. Fall back to
+            # generic detection only when it finds an explicit pager; never invent
+            # page URLs here.
+            return next_page_urls_from_soup(soup, page.final_url, ctx.max_list_pages)
 
         param = str(self.listing.get("page_param") or "")
         if param:

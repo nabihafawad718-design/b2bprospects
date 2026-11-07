@@ -40,9 +40,11 @@ Scripted version:
 
 ```bash
 python scripts/verify_live.py http://127.0.0.1:8765/agents --allow-local
+python scripts/verify_live.py http://127.0.0.1:8765/path/1 --allow-local --engine static
 ```
 
 Then repeat steps 5–9 against a real directory you are permitted to collect from.
+`docs/LIVE_ACCEPTANCE.md` has the per-target evidence procedure.
 
 ---
 
@@ -155,6 +157,21 @@ people just because they share an office phone.
 | "Records came from the embedded payload" | JSON was the source | Verify a few values against the page |
 | "robots.txt note" | Path is disallowed but policy is warn | Review the site's terms and permission |
 
+### Reading the method-attempt table
+
+Every run records each extraction layer it tried and the result. The table is in the
+Data quality card and in the Excel Run Summary.
+
+- **`ok`** — that layer produced records.
+- **`empty`** — the layer was available but produced no usable records; the engine
+  moved to the next one.
+- **`failed`** — an error occurred (shown with the exception); the engine moved on
+  unless the site refused access.
+- **Delivered using** — the layer that actually produced the dataset.
+
+A failure code below the table means no layer produced records. Follow the listed
+next steps. `blocked` is a compliance stop, not a bug to work around.
+
 ## 6. When a layout is not detected
 
 Order of attack:
@@ -231,8 +248,8 @@ redistribution. This guide is operational, not legal advice.
 
 ## 11. Testing status
 
-`python -m unittest discover -s tests -t .` runs 139 tests, including real HTTP
+`python -m unittest discover -s tests -t .` runs 163 tests, including real HTTP
 extraction against the bundled demo for both the static and browser engines. The
 browser's actual Chromium rendering, the Streamlit visual component, and any
 third-party live site still need acceptance on your machine. See
-`docs/V3_CHANGES.md` for the exact list.
+`docs/V4_CHANGES.md` for the exact list.

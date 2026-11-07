@@ -223,15 +223,29 @@ class GenericJsonLdAdapter(DirectoryAdapter):
             fields = _person_fields(person)
             if not fields.get("agent_name"):
                 continue
-            if not any(fields.get(key) for key in ("phone", "email", "street_address", "city", "website", "profile_url")):
+
+            declared = person.get("url") or person.get("@id")
+            profile_url = (
+                canonical_url(urljoin(page.final_url, declared))
+                if isinstance(declared, str) and declared.startswith(("/", "http"))
+                else ""
+            )
+            if profile_url:
+                fields.setdefault("profile_url", profile_url)
+            same_as = person.get("sameAs")
+            if isinstance(same_as, list):
+                same_as = next((item for item in same_as if isinstance(item, str)), "")
+            if isinstance(same_as, str) and same_as.startswith("http"):
+                fields.setdefault("website", canonical_url(same_as))
+
+            if not any(fields.get(key) for key in
+                       ("phone", "email", "street_address", "city", "website", "profile_url")):
                 continue
             key = fields.get("email") or fields.get("phone") or fields["agent_name"].lower()
             if key in seen:
                 continue
             seen.add(key)
 
-            declared = person.get("url")
-            profile_url = canonical_url(urljoin(page.final_url, declared)) if isinstance(declared, str) else ""
             records.append(RawRecord(
                 fields=fields,
                 profile_url=profile_url,

@@ -423,6 +423,21 @@ class PlaywrightSession:
             self.wait(600)
         return clicked
 
+    def reveal_listing_contacts(self) -> int:
+        """Reveal per-card phone/email controls on a listing page."""
+        if not self.reveal_contacts_enabled or self._page is None:
+            return 0
+        from .js import REVEAL_LISTING_CONTACT_JS
+
+        clicked = self.evaluate(REVEAL_LISTING_CONTACT_JS)
+        try:
+            clicked = int(clicked or 0)
+        except (TypeError, ValueError):
+            clicked = 0
+        if clicked:
+            self.wait(900)
+        return clicked
+
     def count_rows(self, selector: str) -> int:
         from .js import COUNT_ROWS_JS
 

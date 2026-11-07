@@ -1,4 +1,4 @@
-# Browser Engine — architecture and limits (v3)
+# Browser Engine — architecture and limits (v4)
 
 This document describes how the browser extraction engine works, what it will and
 will not do, and what remains unproven. Read it before promising a customer that a
@@ -28,25 +28,31 @@ and reusable from the command line.
 
 ## 2. The layered strategy
 
-Cheapest and most reliable first. The method actually used is recorded on every
-record (`Extraction method`) and in the workbook's Run Summary.
+Layers are tried in reliability order and the first identity-bearing result wins. A
+layer that produces nothing is recorded as `empty` and the next is attempted. Every
+attempt appears in the run diagnosis and the workbook's Run Summary.
 
 | Layer | When it wins | Output marker |
 |---|---|---|
-| 1. Embedded JSON | Next.js flight, `__NEXT_DATA__`, `@graph`, `application/json` | `embedded_json` |
-| 2. Rendered DOM | Live cards, tables, grids, unique-class cards | `browser_dom` |
-| 3. Pagination | Layer 1 or 2 repeated across pages | same, with page count |
-| 4. Profile enrichment | Contact details live on the individual profile | merged fields |
-| 5. Site adapter | Layout defeats generic detection | config or Python adapter |
+| 1. Site adapter | A configured domain with listing/profile rules | adapter id |
+| 2. schema.org listing | Complete Person/RealEstateAgent nodes on the roster | `jsonld_listing` |
+| 3. Embedded JSON | Next.js flight, `__NEXT_DATA__`, `@graph`, `application/json` | `embedded_json` |
+| 4. Rendered DOM | Live cards, tables, grids, unique-class cards, link clusters | `browser_dom` |
+| 5. Profile pages | The listing has no usable card data | `browser_profiles` |
+| 6. Sitemap | The roster has no links but profiles are in `sitemap.xml` | `sitemap_profiles` |
 
-Embedded records are preferred when they are at least as rich as the DOM. DOM fields
-are then merged into them, so a payload with names and phones gains the card's
-address or website without duplicating people.
+Embedded/structured records are preferred when they are at least as rich as the DOM.
+DOM fields are then merged into them, so a payload with names and phones gains the
+card's address or website without duplicating people. If an explicit mapping was
+chosen, the DOM layer runs first so the operator's choice is honoured.
 
 A listing page that publishes complete records is a legitimate source on its own.
-The static engine uses those records when contact coverage is good and skips the
-per-profile fetch; profile pages remain the fallback and enrichment source. This is
+Static extraction uses those records when both phone and email are present and field
+coverage is good; profile pages remain the fallback and enrichment source. This is
 what makes a 500-agent roster practical without 500 requests.
+
+Explicit refusals (HTTP 401/403/429, anti-bot challenge) stop the run immediately and
+are never retried by another layer.
 
 ## 3. Detection: how a "row" is found
 

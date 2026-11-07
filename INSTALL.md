@@ -15,7 +15,7 @@ the browser binary is installed separately.
 ## Windows
 
 ```bat
-cd b2bprospects-v3
+cd b2bprospects-v4
 py -m venv .venv
 .venv\Scripts\activate
 py -m pip install --upgrade pip
@@ -33,7 +33,7 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ## macOS / Linux
 
 ```bash
-cd b2bprospects-v3
+cd b2bprospects-v4
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -93,12 +93,15 @@ B2B_ALLOW_LOCAL=true streamlit run app.py
 
 In the dashboard, enter `http://127.0.0.1:8765/agents`, choose **Browser**, and run
 the steps. The demo has 36 agents over three pages and a site-specific JSON adapter.
+It also serves `/path/1`, `/table`, `/embedded`, `/irregular` and `/sitemap-only`
+to exercise different real-world layouts.
 
 Or verify headlessly:
 
 ```bash
 python scripts/extract_cli.py http://127.0.0.1:8765/agents --allow-local --max-pages 3
 python scripts/verify_live.py http://127.0.0.1:8765/agents --allow-local
+python scripts/verify_live.py http://127.0.0.1:8765/path/1 --allow-local --engine static
 ```
 
 ## Run the tests
@@ -107,7 +110,7 @@ python scripts/verify_live.py http://127.0.0.1:8765/agents --allow-local
 python -m unittest discover -s tests -t .
 ```
 
-Expected: 139 tests, OK.
+Expected: 163 tests, OK.
 
 ## First live run
 
@@ -116,8 +119,9 @@ python scripts/assess_site.py https://your-permitted-directory.example/agents
 python scripts/verify_live.py https://your-permitted-directory.example/agents --max-pages 2 --max-records 10
 ```
 
-Read `OPERATOR_GUIDE.md` before delivering data, and `docs/V3_CHANGES.md` for what
-is tested and what still needs live acceptance.
+Read `OPERATOR_GUIDE.md` before delivering data, `docs/V4_CHANGES.md` for the
+implementation record, and `docs/LIVE_ACCEPTANCE.md` for the per-target evidence
+procedure.
 
 ## Common setup problems
 

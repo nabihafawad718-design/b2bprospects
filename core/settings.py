@@ -96,6 +96,8 @@ class Settings:
     browser_reveal_contacts: bool = _env_bool("B2B_BROWSER_REVEAL_CONTACTS", True)
     browser_screenshot_on_error: bool = _env_bool("B2B_BROWSER_SCREENSHOTS", True)
     prefer_embedded: bool = _env_bool("B2B_PREFER_EMBEDDED", True)
+    # Last-resort profile discovery from sitemap.xml. Disable for air-gapped runs.
+    sitemap_fallback: bool = _env_bool("B2B_SITEMAP_FALLBACK", True)
     # Static mode: use complete listing cards instead of opening every profile.
     prefer_listing_records: bool = _env_bool("B2B_PREFER_LISTING_RECORDS", True)
     screenshot_dir: Path = SCREENSHOT_DIR

@@ -231,7 +231,7 @@ REVEAL_CONTACT_JS = r"""
 (() => {
   const patterns = [
     /^show (phone|number|email|contact|details)$/i,
-    /^view (phone|number|email|contact|details|profile)$/i,
+    /^view (phone|number|email|contact|details)$/i,
     /^contact (agent|details|info)$/i,
     /^agent (details|contact)$/i,
     /^reveal (phone|email|contact)$/i,
@@ -266,6 +266,41 @@ COUNT_ROWS_JS = r"""
 """
 
 
+# Reveal contacts on listing cards. Many directories show a "Show phone" button
+# per card; clicking it is an ordinary visitor action, not a bypass. This snippet
+# deliberately excludes "View profile" so it cannot navigate away from the roster.
+REVEAL_LISTING_CONTACT_JS = r"""
+(() => {
+  const patterns = [
+    /^show (phone|number|email|contact|details)$/i,
+    /^reveal (phone|number|email|contact)$/i,
+    /^display (phone|number|email)$/i,
+    /^see (phone|email|contact)$/i,
+    /^contact (details|info)$/i
+  ];
+  const candidates = Array.from(document.querySelectorAll(
+    'button, [role="button"], a[href="#"], a[href^="javascript:"], summary'
+  ));
+  let clicked = 0;
+  for (const el of candidates) {
+    const text = (el.innerText || el.getAttribute('aria-label') || '').trim();
+    if (!text || text.length > 36) continue;
+    if (!patterns.some(p => p.test(text))) continue;
+    const href = el.getAttribute('href') || '';
+    if (href && !href.startsWith('#') && !href.startsWith('javascript:')) continue;
+    try {
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      el.click();
+      clicked += 1;
+      if (clicked >= 120) break;
+    } catch (e) { /* ignore */ }
+  }
+  return clicked;
+})()
+"""
+
+
 ALL_JS_SNIPPETS = {
     "PICKER_JS": PICKER_JS,
     "READ_PICKER_JS": READ_PICKER_JS,
@@ -276,5 +311,6 @@ ALL_JS_SNIPPETS = {
     "DISMISS_OVERLAYS_JS": DISMISS_OVERLAYS_JS,
     "CONTENT_SIGNATURE_JS": CONTENT_SIGNATURE_JS,
     "REVEAL_CONTACT_JS": REVEAL_CONTACT_JS,
+    "REVEAL_LISTING_CONTACT_JS": REVEAL_LISTING_CONTACT_JS,
     "COUNT_ROWS_JS": COUNT_ROWS_JS,
 }

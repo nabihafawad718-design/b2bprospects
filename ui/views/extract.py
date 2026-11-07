@@ -8,12 +8,13 @@ product rather than a bolted-on screen.
 """
 from __future__ import annotations
 
+import pandas as pd
 import streamlit as st
 
 from core.adapters.registry import resolve_adapter
 from core.engine import run_extraction
 from core.inspect_site import inspect_url
-from core.models import CORE_FIELD_KEYS, FIELD_CATALOGUE, FIELD_BY_KEY
+from core.models import CORE_FIELD_KEYS, FIELD_CATALOGUE, FIELD_BY_KEY, header_for
 from core.net import BlockedError, FetchError, PoliteFetcher, RobotsDisallowed
 from core.settings import SETTINGS
 from ui.views.browser_flow import render as render_browser_flow
@@ -130,7 +131,13 @@ def _render_url_and_inspection() -> None:
         st.markdown('<p class="sec-title"><span class="stepnum">2</span>Inspection report</p>', unsafe_allow_html=True)
 
         adapter = resolve_adapter(report.final_url or report.url, "", report.recommended_adapter)
-        capability = "Browser automation required" if report.requires_javascript and not report.profile_link_count else "Static extraction possible"
+        if report.requires_javascript and not (report.profile_link_count or report.container_count
+                                               or report.embedded_record_count or report.jsonld_blocks):
+            capability = "Browser automation required"
+        elif report.profile_link_count or report.container_count or report.embedded_record_count or report.jsonld_blocks:
+            capability = "Static extraction possible"
+        else:
+            capability = "No records detected"
         st.markdown(
             f'<p class="sec-sub">{capability} · '
             f'{"Structured data found" if report.jsonld_blocks else "No structured data"} · '
@@ -159,6 +166,18 @@ def _render_url_and_inspection() -> None:
             ("robots.txt", report.robots_detail or "not checked"),
         ])
 
+        if getattr(report, "detected_layers", None):
+            st.caption("Extraction layers available: " + " · ".join(report.detected_layers))
+        samples = getattr(report, "sample_records", None) or []
+        if samples:
+            with st.expander("Preview of detected records", expanded=False):
+                frame = pd.DataFrame(samples)
+                frame = frame.rename(columns={
+                    key: (FIELD_BY_KEY[key].label if key in FIELD_BY_KEY else header_for(key))
+                    for key in frame.columns
+                })
+                st.dataframe(frame, use_container_width=True, hide_index=True)
+                st.caption("First records on the listing page, before a full extraction.")
         if report.warnings:
             notes(report.warnings)
 

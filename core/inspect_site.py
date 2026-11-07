@@ -242,6 +242,7 @@ def _derive_pattern(urls: list[str]) -> str:
 
 
 _PAGE_PARAMS = ("page", "p", "pg", "paged", "start", "offset", "page_num", "pagenumber", "pageindex")
+_PATH_PAGE = re.compile(r"/(?:page|pages|p|pg)/\d{1,4}/?$", re.I)
 
 
 def _detect_pagination(soup: bs4.BeautifulSoup, page_url: str) -> tuple[str, int, str]:
@@ -255,6 +256,27 @@ def _detect_pagination(soup: bs4.BeautifulSoup, page_url: str) -> tuple[str, int
         aria = str(link.get("aria-label") or "").lower()
         if text in ("next", "next page", "›", "»", "next »", "››") or aria in ("next", "next page"):
             return "next_link", 1, ""
+
+    # Path pagination: /agents/page/2, /team/p/3.
+    for link in soup.find_all("a", href=True):
+        target = urljoin(page_url, str(link["href"]))
+        if _PATH_PAGE.search(urlparse(target).path):
+            return "path_pages", 0, ""
+    if _PATH_PAGE.search(urlparse(page_url).path):
+        return "path_pages", 0, ""
+
+    # Attribute-only next control (icon button in a React pager).
+    for control in soup.find_all(["a", "button"]):
+        blob = " ".join([
+            " ".join(control.get("class") or []),
+            str(control.get("id") or ""),
+            str(control.get("data-testid") or ""),
+            str(control.get("aria-label") or ""),
+            str(control.get("title") or ""),
+        ]).lower()
+        if re.search(r"(next[-_ ]?(page|btn|link|button)?|pagination[-_ ]?next|pager[-_ ]?next)", blob):
+            if str(control.get("aria-disabled") or "").lower() != "true" and not control.has_attr("disabled"):
+                return "next_link", 1, ""
 
     # Numbered links only count when they sit together in one pager, so a footer
     # copyright year is never mistaken for a page number.
@@ -291,7 +313,7 @@ def _detect_pagination(soup: bs4.BeautifulSoup, page_url: str) -> tuple[str, int
 
 
 def _detect_load_more(soup: bs4.BeautifulSoup) -> bool:
-    pattern = re.compile(r"\b(load|show|view|see)\s+(more|additional)\b", re.I)
+    pattern = re.compile(r"\b(load|show|view|see|display)\s+(?:\d+\s+)?(more|additional|further)\b", re.I)
     for el in soup.find_all(["button", "a"]):
         text = clean_text(el.get_text())
         if pattern.search(text):
@@ -336,6 +358,55 @@ def inspect_page(page: FetchedPage, fetcher: PoliteFetcher | None = None,
         report.profile_link_samples = links[:5]
         report.profile_link_pattern = _derive_pattern(links)
 
+    # A roster can publish records in cards or a table without linking to separate
+    # profiles. Detect that structure too, so inspection does not report "nothing"
+    # when the static engine can in fact extract the page.
+    structure_fields: list[str] = []
+    if not links:
+        try:
+            from .browser.structure import analyze_html
+
+            models = analyze_html(page.text, page.final_url)
+        except Exception:
+            models = []
+        if models:
+            best = models[0]
+            report.container_selector = best.row_selector
+            report.container_signature = best.signature
+            report.container_count = best.row_count
+            report.estimated_records = best.row_count
+            kind_map = {
+                "name": "agent_name", "first_name": "agent_name", "last_name": "agent_name",
+                "phone": "phone", "email": "email",
+                "address": "street_address", "city": "city", "state": "state",
+                "postal_code": "postal_code", "country": "country",
+                "brokerage": "brokerage_name", "website": "website",
+                "url": "profile_url", "title": "title",
+            }
+            for column in best.columns:
+                field = kind_map.get(column.kind_hint)
+                if field and field not in structure_fields:
+                    structure_fields.append(field)
+            report.sample_records = [
+                {
+                    kind_map.get(column.kind_hint, column.kind_hint):
+                        (column.sample_values[0] if column.sample_values else "")
+                    for column in best.columns[:12]
+                }
+            ]
+
+    # --- embedded records --------------------------------------------------
+    embedded_records: list = []
+    embedded_payload = ""
+    try:
+        from .browser.embedded import extract_from_embedded
+
+        embedded_records, embedded_payload = extract_from_embedded(page.text, page.final_url)
+        report.embedded_record_count = len(embedded_records)
+        report.embedded_payloads = [embedded_payload] if embedded_payload else []
+    except Exception:
+        pass
+
     # --- navigation --------------------------------------------------------
     report.pagination_type, report.pagination_pages, report.pagination_param = _detect_pagination(
         soup, page.final_url
@@ -372,11 +443,47 @@ def inspect_page(page: FetchedPage, fetcher: PoliteFetcher | None = None,
             available.append("website")
         if report.profile_link_count:
             available.extend(["profile_url", "source_url", "brokerage_name"])
+    available.extend(structure_fields)
     report.available_fields = list(dict.fromkeys(available))
+    if embedded_records:
+        for key in ("agent_name", "brokerage_name", "phone", "email", "street_address",
+                    "city", "state", "postal_code", "website", "profile_url", "title"):
+            if key not in report.available_fields:
+                report.available_fields.append(key)
+        report.sample_records = [
+            {
+                key: str(value)[:200]
+                for key, value in (record.fields or {}).items()
+                if value and not str(key).startswith("_")
+            }
+            for record in embedded_records[:5]
+        ]
+    report.suggested_fields = {key: "detected" for key in report.available_fields}
+    report.detected_layers = [
+        layer_name for layer_name, present in (
+            ("schema.org structured data", bool(report.jsonld_blocks)),
+            (f"embedded JSON ({embedded_payload})", bool(embedded_records)),
+            ("profile links", bool(report.profile_link_count)),
+            ("listing blocks", bool(report.container_count)),
+        ) if present
+    ]
 
     # --- capability --------------------------------------------------------
     script_count = len(re.findall(r"<script\b", page.text, flags=re.I))
-    if report.profile_link_count == 0:
+    if report.profile_link_count == 0 and report.embedded_record_count >= 3:
+        report.requires_javascript = False
+        report.warnings.append(
+            f"{report.embedded_record_count} records are available in embedded JSON "
+            f"“{embedded_payload or 'payload'}”, so this page can be extracted without a browser."
+        )
+    elif report.profile_link_count == 0 and report.container_count > 0:
+        report.requires_javascript = False
+        report.warnings.append(
+            f"No separate profile links were found, but {report.container_count} records are "
+            "visible in repeated cards or a table. Static extraction can use those records "
+            "directly; profile enrichment is not available for this layout."
+        )
+    elif report.profile_link_count == 0:
         if report.jsonld_blocks > 0:
             report.requires_javascript = False
             report.warnings.append(
@@ -424,13 +531,106 @@ def inspect_page(page: FetchedPage, fetcher: PoliteFetcher | None = None,
         report.recommended_adapter = "generic_jsonld"
     elif report.profile_link_count:
         report.recommended_adapter = "generic_html"
+    elif report.container_count:
+        report.recommended_adapter = "generic_html"
     elif report.requires_javascript:
         report.recommended_adapter = "browser_required"
     else:
         report.recommended_adapter = ""
 
-    report.estimated_records = report.container_count
+    report.estimated_records = max(report.container_count, report.embedded_record_count)
     return report
+
+
+_SITEMAP_PATHS = (
+    "/sitemap.xml",
+    "/sitemap_index.xml",
+    "/sitemap-index.xml",
+    "/sitemaps/sitemap.xml",
+    "/wp-sitemap.xml",
+)
+_SITEMAP_SKIP = re.compile(
+    r"(/blog/|/news/|/article|/press/|/event|/career|/job|/faq|/privacy|/terms|"
+    r"/legal|/search|/tag/|/category/|/author/|/page/|\.xml$|\.gz$|\.jpg|\.png|\.pdf)",
+    re.I,
+)
+
+
+def _xml_locs(text: str) -> list[str]:
+    """Read <loc> values without assuming a well-formed namespace."""
+    try:
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(text.strip())
+        locs: list[str] = []
+        for element in root.iter():
+            if str(element.tag).lower().endswith("loc") and element.text:
+                value = clean_text(element.text)
+                if value:
+                    locs.append(value)
+        if locs:
+            return locs
+    except Exception:
+        pass
+    return [clean_text(value) for value in re.findall(r"<loc[^>]*>(.*?)</loc>", text, re.I | re.S)]
+
+
+def discover_sitemap_profile_urls(
+    base_url: str,
+    fetcher: PoliteFetcher,
+    settings=None,
+    max_urls: int = 50,
+    max_sitemaps: int = 4,
+) -> list[str]:
+    """Discover profile URLs from a site's XML sitemap.
+
+    This is the last-resort structural layer for a directory whose roster is
+    JavaScript-only but whose profiles are individually listed in the sitemap.
+    It only reads sitemap files; it does not bypass any access control.
+    """
+    base_url = base_url or ""
+    host = host_of(base_url)
+    if not host:
+        return []
+    root = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
+    queue = [urljoin(root, path) for path in _SITEMAP_PATHS]
+    seen_sitemaps: set[str] = set()
+    found: list[str] = []
+
+    while queue and len(seen_sitemaps) < max_sitemaps and len(found) < max_urls:
+        sitemap_url = queue.pop(0)
+        key = canonical_url(sitemap_url)
+        if not key or key in seen_sitemaps:
+            continue
+        seen_sitemaps.add(key)
+        page = fetcher.get_optional(sitemap_url)
+        if page is None or page.status_code != 200:
+            continue
+        text = page.text[:5_000_000]
+        locs = _xml_locs(text)
+        if not locs:
+            continue
+        if "<sitemapindex" in text.lower():
+            for loc in locs[:12]:
+                if len(seen_sitemaps) + len(queue) >= max_sitemaps * 2:
+                    break
+                queue.append(urljoin(root, loc))
+            continue
+        for loc in locs:
+            absolute = urljoin(root, loc)
+            if not same_site(absolute, base_url):
+                continue
+            path = urlparse(absolute).path
+            if _SITEMAP_SKIP.search(path + "/"):
+                continue
+            if not _looks_like_profile(absolute, host):
+                continue
+            canonical = canonical_url(absolute)
+            if canonical and canonical not in found:
+                found.append(canonical)
+            if len(found) >= max_urls:
+                break
+    return found
 
 
 def inspect_url(url: str, fetcher: PoliteFetcher, check_sitemap: bool = True) -> InspectionReport:

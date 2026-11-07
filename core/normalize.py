@@ -63,7 +63,10 @@ _ADDRESS_WORDS = re.compile(
     re.I,
 )
 _SUITE = re.compile(r"^(suite|ste|unit|apt|apartment|floor|fl|#)\b", re.I)
-_TITLE_CASE_NAME = re.compile(r"^[A-Z][A-Za-z'’\-]+(\s+[A-Z](?:[A-Za-z'’\-]*|\.)){1,4}$")
+_NAME_WORD = r"[^\W\d_][\w'’\-]*"
+_TITLE_CASE_NAME = re.compile(
+    rf"^{_NAME_WORD}(?:\s+[^\W\d_][\w'’\-.]*){{1,4}}$", re.UNICODE
+)
 
 
 def _smart_title(text: str) -> str:
@@ -105,8 +108,9 @@ def normalize_name(raw: object) -> str:
     # "Smith, Jane" -> "Jane Smith" only when both parts look like names.
     if len(keep) >= 2:
         first, second = keep[0].strip(), keep[1].strip()
-        if (re.fullmatch(r"[A-Z][a-z'’\-]+(?:\s+[A-Z][a-z'’\-]+)?", first)
-                and re.fullmatch(r"[A-Z][a-z'’\-]+(?:\s+[A-Z]\.?)?", second)
+        name_word = r"[^\W\d_][\w'’\-]+"
+        if (re.fullmatch(rf"{name_word}(?:\s+{name_word})?", first, re.UNICODE)
+                and re.fullmatch(rf"{name_word}(?:\s+[^\W\d_][\w'’\-.]*)?", second, re.UNICODE)
                 and first.lower() not in _NAME_CREDENTIALS):
             name = f"{second} {first}"
     name = _smart_title(name)
@@ -131,7 +135,10 @@ def looks_like_person_name(text: object) -> bool:
         return False
     # "Dr. Jane Smith" and "Prof. J. Smith" are names, not titles.
     stripped = re.sub(r"^(mr|mrs|ms|miss|dr|prof|sir|dame|rev)\.?\s+", "", value, flags=re.I)
-    return bool(_TITLE_CASE_NAME.match(value) or _TITLE_CASE_NAME.match(stripped) or value.isupper())
+    for candidate in (value, stripped):
+        if _TITLE_CASE_NAME.match(candidate) and (candidate.istitle() or candidate.isupper()):
+            return True
+    return False
 
 
 def looks_like_org_name(text: object) -> bool:

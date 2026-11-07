@@ -1,121 +1,152 @@
-# Implemented features and testing status
+# Implemented features and testing status — v4
 
-This is the delivery checklist for v3. The detailed engineering record is
-`docs/V3_CHANGES.md`; the operational guide is `OPERATOR_GUIDE.md`.
+This is the delivery checklist. The detailed engineering record is
+`docs/V4_CHANGES.md`; the live acceptance procedure is `docs/LIVE_ACCEPTANCE.md`;
+the operational guide is `OPERATOR_GUIDE.md`.
 
 ---
 
 ## 1. Implemented and locally tested
 
-### Website understanding
+### Layered extraction and diagnosis
 
-- One-click browser inspection: title, final URL, robots status, repeated rows,
-  candidate structures, pagination style, embedded payloads, available fields.
-- Repeated-region detection for cards, grids, tables, nested wrappers, and cards
-  with unique per-record classes.
-- Column profiling: sample values, fill rate, href rate, and kind guessing for
-  names, phones, emails, addresses, cities, brokerages, websites and profile URLs.
-- Job-title disambiguation and person/brokerage separation.
-- Static inspection fallback that understands unique-class rosters.
+- Every browser run tries supported layers in reliability order: configured site
+  adapter, schema.org listing records, embedded JSON, rendered DOM cards,
+  profile-link clusters, profile pages, sitemap-listed profiles.
+- A layer that produces no usable records is recorded and the next layer is tried.
+  The chosen layer, its record count and every failed/empty layer are shown in the
+  UI and written into the Excel Run Summary.
+- Static mode also layers adapter records, generic cards, schema.org, embedded JSON
+  and sitemap discovery, merging records by name and contact identity.
+- Failure codes distinguish access refusal, 404, server error, JavaScript-only page,
+  single profile, not a listing, empty mapping, no records and stalled pagination.
+- HTTP 401/403/429 and anti-bot challenges stop the run; they are never retried or
+  bypassed.
+
+### Website understanding and fields
+
+- Repeated-region detection for cards, grids, tables, nested wrappers, cards with
+  unique per-record classes, and irregular rows recovered by profile-link clustering.
+- Table headings map first/last name, full name, title, phone, mobile, email, office,
+  address, city, state/province, postal code and country.
+- Separate first/last columns are joined into the full name; the last-name column is
+  kept as an extra. Job titles are exported as an extra column, not mistaken for a
+  person's name.
+- `data-*` attributes, microdata, `tel:`/`mailto:` anchors, icon-only contacts and
+  combined addresses are read. If a selected field has no mapped column, row-level
+  fallbacks still try to fill it in static mode.
 - Embedded payload discovery: `__NEXT_DATA__`, `__NUXT_DATA__`, `__APOLLO_STATE__`,
-  `application/json`, `application/ld+json`, `window.__X__`, Next.js flight chunks.
-- schema.org `@graph`, `ItemList` and full Person nodes.
-- False-positive guards for menu/product/blog JSON arrays.
+  `application/json`, `application/ld+json`, `window.__X__`, Next.js flight chunks,
+  schema.org `@graph` and `ItemList`.
+- Relative profile URLs in embedded JSON resolve against the listing URL.
+- Listing Person nodes with only a name and URL are kept; profile pages can complete
+  them rather than the roster being rejected.
+- False-positive guards for menus, products and blog JSON arrays.
 
 ### Extraction
 
-- Static and browser extraction modes sharing one quality/export pipeline.
-- Listing-page records used directly when they carry contact/company data, avoiding
-  hundreds of profile requests; profile pages remain fallback/enrichment.
-- Profile-page extraction and optional enrichment, including configured site fields.
-- Ordinary "show phone / show email / contact details" interactions.
-- Row-level fallbacks from `tel:`/`mailto:` anchors, text patterns, `data-*`
-  attributes, icon links, and headings.
-- Profile-link scoring instead of taking the first anchor.
-- Extra columns: titles, licence numbers, MLS IDs, languages, or any detected value.
-- Pagination: next button, numbered links, numbered buttons, query-param pages,
-  load-more, infinite scroll, with stall detection and page/record caps.
-- Embedded-vs-DOM preference and gap merging.
-- Config-driven site adapters from JSON, no Python required; Python adapter path
-  remains.
-- Clear failure reporting for 401/403/429, challenges, 404, timeouts, no structure,
-  no records, stalled pagination.
-- Browser screenshot on error (when Playwright is present).
+- Static and browser extraction share one quality/export pipeline.
+- Complete listing cards are used directly when they carry both phone and email and
+  enough of the requested fields; otherwise profile pages remain the better source.
+  A site adapter with complete cards is not limited by the profile cap.
+- Profile pages are parsed with JSON-LD first (even through the generic HTML
+  adapter), then microdata/heuristics; ordinary "show phone/email" controls are
+  clicked when present.
+- Ordinary per-card "show phone/email" controls on the listing are revealed before
+  analysis.
+- Extra columns: titles, licence numbers, MLS IDs, languages or any detected value.
+- Screenshot on error when Playwright is available.
+- Clear refusal handling for 401/403/429 and challenge pages.
+
+### Pagination
+
+- Next links/buttons including `rel=next`, text, aria-label and attribute-only
+  controls (`data-testid`, class, id, title).
+- Numbered links and buttons; path pages (`/agents/page/2`, `/p/2`); numeric URL tails
+  (`/agents/2`) when a row structure was detected; query parameters with offset step
+  inference.
+- Load-more and infinite scroll, with row-count/signature checks.
+- Visited-URL tracking, duplicate-page and duplicate-record prevention, two-empty-page
+  tolerance, and an explicit stop reason.
 
 ### Visual selection
 
-- Captured rendered page shown inside the dashboard.
+- Rendered page snapshot shown inside the dashboard.
 - Hover highlight, repeated-row detection, sibling outline, table-row awareness.
-- Click returns a position path; Python maps it to a detected column.
-- Canonical fields and custom (extra) fields.
-- Snapshot sanitizer removes scripts/frames/event handlers/CSP/refresh.
+- Click returns a position path plus a CSS selector; Python resolves the click against
+  the snapshot DOM and maps it to the detected column. Snapshot sanitization removes
+  the same non-content tags as the detector, so paths remain aligned.
+- Canonical fields, custom fields, and automatically detected extra columns.
 - Fallback to column dropdowns when the component or snapshot is unavailable.
 
 ### Data processing and delivery
 
-- Normalization: phones (including extensions), emails (including `[at]` forms),
-  names (credentials, ALL CAPS, prefixes), US/CA/UK/AU addresses, URLs.
-- Deduplication with seven strategies plus the smart default.
-- Search, filters (name/phone/email/contact/city/state/flag/missing field), sorting.
-- Issue review and per-record quality flags.
-- Field coverage per export.
-- Import/export of arbitrary extra columns.
+- Normalization: phones (extensions), emails, names (credentials, ALL CAPS,
+  prefixes), US/CA/UK/AU addresses, URLs.
+- Extraction-time phone/email normalization for mapped and data-attribute columns.
+- Deduplication with seven strategies plus the smart default; shared office phones do
+  not merge different people.
+- Search, filters, sorting, issue review, per-record quality flags, field coverage.
 - CSV, Excel (Records + Run Summary + optional Issues), JSON.
-- Source URL per record and collection timestamp.
-- Run history, health baselines, adapter-health dashboard, supported-adapter list.
+- Source URL and collection timestamp per record; extraction methods and diagnosis in
+  the Run Summary; formula-injection protection in spreadsheets.
+- Run history and adapter-health baselines.
+- Paywall preserved and off by default; theme and OSM discovery workspace preserved.
 
 ### Operations
 
-- Preserved original B2BProspects theme and OSM Local Discovery workspace.
-- Paywall still present and off by default.
 - Headless CLI: static/browser/auto, inspect, fields, formats, local demo.
-- Local demo directory with 36 agents, profiles, schema.org, JSON adapter, extra
-  columns and a hidden-email reveal.
-- Robots policy: `warn` (default), `enforce`, `ignore`.
+- Live verification script for browser, static and inspect-only modes, with optional
+  JSON evidence.
+- Demo server variants: query pagination, path pagination, table with headers,
+  embedded-JSON-only, irregular cards, sitemap-only roster, profiles and hidden email.
+- Config-driven JSON site adapters; Python adapter path remains.
 - SSRF guard, loopback-only demo exception, redirect-final-hop check.
-- Documentation: README, operator guide, browser engine, v3 record, adapter README.
+- Robots policy: `warn` (default), `enforce`, `ignore`.
 
 ---
 
 ## 2. Proven by the test suite
 
-`python -m unittest discover -s tests -t .` → **139 tests, OK** (~10–20s).
+`python -m unittest discover -s tests -t .` → **163 tests, OK** (~12–20s).
 
 Highlights:
 
-- **Real HTTP**, not mocks, against `scripts/serve_demo.py` on loopback:
-  - static extraction: 36 records, 3 pages, 0 profile fetches, correct address and
-    extras;
-  - browser engine: inspect, next-button navigation, 36 records across 3 pages;
-  - CLI: 36-row CSV with licence column;
-  - robots warn vs enforce.
-- Detection across card, table, unique-class, icon-contact, data-attribute and
-  nested layouts.
-- Embedded JSON, Next flight, `@graph`, `ItemList`, and menu/blog rejection.
-- Extra columns through mapping → record → CSV/Excel.
-- Cleaning, filters, duplicate strategies, issue sheet.
-- Visual picker sanitizer, path-to-column mapping, and JavaScript syntax (Node).
-- Streamlit render paths for every view, including visual selection update,
-  embedded-only extraction, and no-records messaging.
-- Playwright control flow against a fake Playwright API.
+- **Real HTTP** against a loopback server, not mocks:
+  - static extraction from embedded JSON with no DOM records;
+  - path pagination (`/paged/page/1` → `/paged/page/2`);
+  - sitemap-only roster discovered through `/sitemap.xml`;
+  - HTTP 403 refusal raises and stops;
+  - existing demo: 36 records over 3 pages, 0 profile fetches, extras, browser
+    navigation over real HTTP, CLI CSV.
+- Browser layered fallback: an empty DOM mapping falls through to embedded records;
+  method attempts and failure codes are asserted.
+- Table headers, first/last joining, title extras, data attributes, link clusters,
+  job-title disambiguation.
+- Path pagination, numeric tails, attribute next controls, disabled controls,
+  path walking and empty-page stops.
+- Snapshot path parity and selector-based visual mapping.
+- Embedded relative URLs and JSON-LD name+URL listings.
+- Formula-injection escaping and diagnosis rows in Excel.
+- Cleaning, filters, duplicate strategies, issue sheet, config adapters.
+- Node syntax checks for every injected JavaScript snippet.
 
 ---
 
 ## 3. Built but requiring live acceptance on your machine
 
-These are implemented and locally exercised, but cannot be certified from this
-build environment (no external network, no Playwright/Chromium, no Streamlit):
+The build environment has **no outbound network** (external hosts return HTTP 403
+through the proxy), **no Playwright/Chromium** and **no Streamlit**. Therefore these
+are implemented and locally exercised, but not certified live:
 
 1. **Real Chromium rendering** of a third-party site's JavaScript.
-2. **Visual picker inside a live Streamlit server** — hover, click, highlight,
+2. **Visual picker inside a live Streamlit server** — hover, click, highlight and
    mapping update with the real component iframe.
-3. **Live pagination variants** on real sites (query-param, numbered-button,
-   load-more, infinite scroll).
-4. **Live profile "show contact" interactions**.
+3. **Live pagination variants** on third-party sites.
+4. **Live profile "show contact" interactions.**
 5. **Real anti-bot responses** (the tool is designed to stop, not bypass).
 6. **Config adapters for your real target sites** — add JSON, verify selectors.
-7. **Excel opening in Microsoft Excel** (the file is generated and read back by
-   openpyxl here).
+7. **Excel opening in Microsoft Excel** (generated and read back by openpyxl here).
 8. **OSM Local Discovery against current public services** (code unchanged).
 
 ### Acceptance sequence
@@ -127,14 +158,18 @@ B2B_ALLOW_LOCAL=true streamlit run app.py
 ```
 
 Enter `http://127.0.0.1:8765/agents`, run Browser mode, use the visual picker,
-extract 3 pages, clean, export.
+extract 3 pages, clean, export. Then try `/path/1`, `/table`, `/embedded`,
+`/irregular` and `/sitemap-only`.
 
-Then scripted:
+Scripted:
 
 ```bash
 python scripts/verify_live.py http://127.0.0.1:8765/agents --allow-local
-python scripts/verify_live.py https://your-permitted-directory.example/agents --max-pages 2 --max-records 10
+python scripts/verify_live.py http://127.0.0.1:8765/path/1 --allow-local --engine static
+python scripts/verify_live.py https://your-permitted-directory.example/agents --max-pages 2 --max-records 10 --json-out evidence.json
 ```
+
+See `docs/LIVE_ACCEPTANCE.md` for the per-target evidence checklist.
 
 ---
 
@@ -142,10 +177,11 @@ python scripts/verify_live.py https://your-permitted-directory.example/agents --
 
 - No CAPTCHA solving, stealth/anti-bot evasion, proxy rotation, login handling, or
   paywall bypass.
-- No claim that any specific live site works until it is tested.
-- robots.txt is reported, not treated as automatic permission or automatic
-  rejection; `enforce` is available.
-- Structured data and explicit anchors are preferred over regex; regex contact
-  extraction can still produce false positives and is flagged for review.
+- No claim that any specific live site works until it is tested and evidence recorded.
+- robots.txt is reported, not treated as automatic permission or automatic rejection;
+  `enforce` is available.
+- Structured data and explicit anchors are preferred over regex; regex contacts can
+  still produce false positives and are flagged for review.
 - Address parsing is strongest for US formats.
+- Sitemap discovery depends on readable sitemap URLs and profile-shaped paths.
 - One operator, local machine; do not expose the app publicly as-is.

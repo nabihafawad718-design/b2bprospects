@@ -24,6 +24,21 @@ from .models import FIELD_BY_KEY, Record, RunResult, header_for
 from .quality import export_columns
 
 
+def _safe_cell(value):
+    """Stop spreadsheet formula injection without mangling phone numbers.
+
+    A value beginning with =, @, tab or CR is always escaped. A leading + or - is
+    escaped only when it is not the start of a phone-like number.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    if value.startswith(("=", "@", "\t", "\r")):
+        return "'" + value
+    if value[0] in "+-" and not re.search(r"\d", value[:4]):
+        return "'" + value
+    return value
+
+
 def records_to_frame(records: list[Record], selected_fields: list[str],
                      extra_keys: list[str] | None = None) -> pd.DataFrame:
     keys = available_extra_keys(records) if extra_keys is None else list(extra_keys)
@@ -31,7 +46,7 @@ def records_to_frame(records: list[Record], selected_fields: list[str],
     rows = []
     for record in records:
         row = record.to_row()
-        rows.append({column: row.get(column, "") for column in columns})
+        rows.append({column: _safe_cell(row.get(column, "")) for column in columns})
     frame = pd.DataFrame(rows, columns=columns)
     return frame.rename(columns={c: header_for(c) for c in frame.columns})
 
@@ -85,6 +100,21 @@ def _summary_rows(run: RunResult, records: list[Record],
         ("Pages fetched", str(run.pages_fetched)),
         ("Robots.txt", run.inspection.robots_detail or "not checked"),
     ]
+    diagnosis = getattr(run, "diagnosis", None)
+    if diagnosis is not None and getattr(diagnosis, "attempts", None):
+        rows.append(("", ""))
+        rows.append(("Extraction methods tried", ""))
+        for attempt in diagnosis.attempts:
+            rows.append((
+                f"  {attempt.label}",
+                f"{attempt.status} · {attempt.records} record(s) · {attempt.detail}",
+            ))
+        if diagnosis.selected_label:
+            rows.append(("  Delivered using", diagnosis.selected_label))
+        if diagnosis.failure_code:
+            rows.append(("  Failure diagnosis", f"{diagnosis.failure_code}: {diagnosis.summary}"))
+        for recommendation in diagnosis.recommendations:
+            rows.append(("  Next step", recommendation))
     combined = {**run.export_context, **(context or {})}
     if combined:
         rows.append(("", ""))

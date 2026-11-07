@@ -113,12 +113,39 @@ def heuristic_profile(soup: bs4.BeautifulSoup, page_url: str) -> RawRecord:
     scopes = _scope_candidates(soup)
 
     name = _heading_name(soup)
+    if not name:
+        for attribute in ("data-name", "data-full-name", "data-agent-name"):
+            node = soup.find(attrs={attribute: True})
+            if node:
+                candidate = normalize_name(node.get(attribute))
+                if candidate:
+                    name = candidate
+                    break
     if name:
         fields["agent_name"] = name
 
     phone = ""
     email = ""
     address_text = ""
+    for attribute in ("data-phone", "data-telephone", "data-tel", "data-mobile"):
+        node = soup.find(attrs={attribute: True})
+        if node:
+            display, _digits = normalize_phone(node.get(attribute))
+            if display:
+                phone = display
+                break
+    for attribute in ("data-email",):
+        node = soup.find(attrs={attribute: True})
+        if node:
+            found = find_emails(str(node.get(attribute)), limit=1)
+            if found:
+                email = found[0]
+                break
+    for attribute in ("data-address", "data-street"):
+        node = soup.find(attrs={attribute: True})
+        if node:
+            address_text = clean_text(node.get(attribute))
+            break
     for scope in scopes:
         if not phone:
             phone = _first_tel_anchor(scope)
@@ -237,6 +264,22 @@ def next_page_urls_from_soup(soup: bs4.BeautifulSoup, base_url: str,
             urls.append(urljoin(base_url, link["href"]))
             break
 
+    # Path pagination (/agents/page/2) and attribute-only next controls.
+    if not urls:
+        try:
+            from ..browser.pagination import detect_pagination
+
+            row_hint = "a" if len(soup.find_all("a", href=True)) >= 3 else ""
+            plan = detect_pagination(str(soup), base_url, row_hint)
+            if plan.strategy == "path_pages":
+                urls.extend(plan.page_urls)
+            elif plan.strategy == "next_button" and plan.selector:
+                node = soup.select_one(plan.selector)
+                if node is not None and node.get("href"):
+                    urls.append(urljoin(base_url, str(node["href"])))
+        except Exception:
+            pass
+
     # Numbered pagination must look like a pager, not a stray year or price in a
     # footer. Require two or more numbered links that share a path and stay small.
     by_path: dict[str, list[tuple[int, str]]] = {}
@@ -349,4 +392,17 @@ class GenericHtmlAdapter(DirectoryAdapter):
         return meaningful if len(meaningful) >= 2 else []
 
     def parse_profile(self, page: FetchedPage, ctx: AdapterContext) -> RawRecord | None:
+        # Structured data is higher fidelity than heuristics, even when the listing
+        # did not contain enough JSON-LD to select the JSON-LD adapter.
+        try:
+            from .generic_jsonld import GenericJsonLdAdapter
+
+            structured = GenericJsonLdAdapter().parse_profile(page, ctx)
+            if structured is not None and len([
+                key for key, value in (structured.fields or {}).items()
+                if value and key != "agent_name"
+            ]) >= 2:
+                return structured
+        except Exception:
+            pass
         return heuristic_profile(parse_html(page.text), page.final_url)

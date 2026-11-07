@@ -69,6 +69,10 @@ def main() -> int:
     print(f"Repeated blocks  : {report.container_count}  selector={report.container_selector or '—'}")
     print(f"Pagination       : {report.pagination_type}")
     print(f"Load-more        : {'yes' if report.load_more_detected else 'no'}")
+    print(f"Embedded records : {report.embedded_record_count}  payloads={report.embedded_payloads[:3]}")
+    print(f"Sitemap          : {'found' if report.sitemap_found else 'not found'}")
+    if report.detected_layers:
+        print(f"Detected layers  : {' · '.join(report.detected_layers)}")
     print()
 
     html = _safe_html(fetcher, report.final_url)
@@ -91,6 +95,15 @@ def main() -> int:
     embedded, payload = extract_from_embedded(html, report.final_url)
     if embedded:
         print(f"Embedded records : {len(embedded)}  payload={payload}")
+        print("Embedded sample  :")
+        for key, value in list((embedded[0].fields or {}).items())[:8]:
+            print(f"  {key:16s} {str(value)[:70]}")
+    elif structures:
+        first = structures[0]
+        print("Static row sample:")
+        for column in first.columns[:6]:
+            sample = (column.sample_values[0] if column.sample_values else "")[:60]
+            print(f"  [{column.index}] {column.kind_hint:10s} “{sample}”")
     print()
 
     print("--- Permission checklist (you must confirm each of these) ---")

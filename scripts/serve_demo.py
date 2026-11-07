@@ -105,6 +105,7 @@ header{background:#fff;border-bottom:1px solid var(--line)}.wrap{max-width:1100p
 .profile h1{margin:0}.kv{display:grid;grid-template-columns:150px 1fr;gap:8px 18px;margin-top:20px;font-size:14px}.kv dt{color:var(--muted)}.kv dd{margin:0}
 button{font:inherit;font-weight:700;font-size:13px;color:#fff;background:var(--accent);border:0;border-radius:8px;padding:9px 13px;cursor:pointer}
 footer{color:var(--muted);font-size:12px;padding:25px 0 40px;border-top:1px solid var(--line)}
+table.roster{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden;margin:10px 0 40px}table.roster th,table.roster td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;font-size:13px}table.roster th{background:#faf9ff;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
 """
 
 
@@ -165,6 +166,95 @@ def listing_html(page: int) -> str:
 <nav class="pager">{''.join(pager)}</nav>
 <script type="application/ld+json">{json.dumps(jsonld)}</script>"""
     return _shell(f"Agents — page {page}", body)
+
+
+def _cards_only(page: int, page_size: int = PAGE_SIZE) -> str:
+    start = (page - 1) * page_size
+    chunk = AGENTS[start:start + page_size]
+    cards = []
+    for agent in chunk:
+        cards.append(
+            f'<article class="demo-card"><h3><a class="demo-card__link" '
+            f'href="/agents/{agent["slug"]}">{agent["name"]}</a></h3>'
+            f'<p class="demo-card__office">{agent["brokerage"]}</p>'
+            f'<p class="demo-card__phone">{agent["phone"]}</p>'
+            f'<p class="demo-card__email">{agent["email"]}</p>'
+            f'<p class="demo-card__address">{agent["street"]}, {agent["city"]}, '
+            f'{agent["state"]} {agent["postal"]}</p></article>'
+        )
+    return "".join(cards)
+
+
+def path_listing_html(page: int) -> str:
+    """Path-paginated roster with no next link (tests URL-pattern pagination)."""
+    body = (
+        f'<div class="hero"><h1>Path-paginated agents</h1>'
+        f'<p class="lede">Page {page}. Pagination lives at /path/2, /path/3, …</p></div>'
+        f'<div class="grid">{_cards_only(page)}</div>'
+    )
+    return _shell(f"Path pagination — page {page}", body)
+
+
+def table_listing_html() -> str:
+    rows = []
+    for agent in AGENTS[:10]:
+        rows.append(
+            f"<tr><td>{agent['name'].split()[0]}</td><td>{agent['name'].split()[-1]}</td>"
+            f"<td>{agent['title']}</td><td>{agent['phone']}</td><td>{agent['email']}</td>"
+            f"<td>{agent['brokerage']}</td><td>{agent['city']}</td><td>{agent['state']}</td></tr>"
+        )
+    body = (
+        '<div class="hero"><h1>Table directory</h1><p class="lede">A plain table with '
+        'first/last names, title, phone, email, office, city and state.</p></div>'
+        '<table class="roster"><thead><tr><th>First Name</th><th>Last Name</th><th>Title</th>'
+        '<th>Office Phone</th><th>Email</th><th>Office</th><th>City</th><th>State</th>'
+        f"</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+    )
+    return _shell("Table directory", body)
+
+
+def embedded_listing_html() -> str:
+    records = [
+        {"name": agent["name"], "brokerage": agent["brokerage"], "phone": agent["phone"],
+         "email": agent["email"], "street_address": agent["street"], "city": agent["city"],
+         "state": agent["state"], "postal_code": agent["postal"],
+         "profile_url": f"/agents/{agent['slug']}"}
+        for agent in AGENTS[:10]
+    ]
+    payload = {"props": {"pageProps": {"agents": records}}}
+    body = (
+        '<div id="app-root"></div>'
+        '<p class="lede">The records below exist only inside the embedded JSON payload; '
+        "the DOM is an empty React root.</p>"
+        f'<script id="__NEXT_DATA__" type="application/json">{json.dumps(payload)}</script>'
+    )
+    return _shell("Embedded JSON directory", body)
+
+
+def irregular_listing_html() -> str:
+    tags = ["section", "article", "div", "aside"]
+    parts = []
+    for index, agent in enumerate(AGENTS[:5]):
+        tag = tags[index % len(tags)]
+        parts.append(
+            f'<{tag} class="irregular-{index}"><a href="/agents/{agent["slug"]}">'
+            f'{agent["name"]}</a><p>{agent["phone"]}</p><p>{agent["brokerage"]}</p></{tag}>'
+        )
+    body = (
+        '<div class="hero"><h1>Irregular cards</h1><p class="lede">Each record uses a '
+        'different tag and class; only profile-link clustering can find them.</p></div>'
+        f'<div id="roster">{"".join(parts)}</div>'
+    )
+    return _shell("Irregular cards", body)
+
+
+def sitemap_only_html() -> str:
+    body = (
+        '<div class="hero"><h1>Agents</h1><p class="lede">'
+        + ("This roster is intentionally link-free so sitemap discovery can be tested. " * 8)
+        + "</p></div>"
+    )
+    return _shell("Sitemap-only directory", body)
 
 
 def profile_html(agent: dict[str, str]) -> str:
@@ -260,6 +350,28 @@ class DemoHandler(BaseHTTPRequestHandler):
                 return
             self._send(200, listing_html(page))
             return
+        if path.startswith("/path/"):
+            try:
+                page = int(path.rsplit("/", 1)[1])
+            except ValueError:
+                page = 0
+            if not (1 <= page <= PAGE_COUNT):
+                self._send(404, _shell("Not found", "<div class='hero'><h1>Page not found</h1></div>"))
+                return
+            self._send(200, path_listing_html(page))
+            return
+        if path == "/table":
+            self._send(200, table_listing_html())
+            return
+        if path == "/embedded":
+            self._send(200, embedded_listing_html())
+            return
+        if path == "/irregular":
+            self._send(200, irregular_listing_html())
+            return
+        if path == "/sitemap-only":
+            self._send(200, sitemap_only_html())
+            return
         if path.startswith("/agents/"):
             slug = path.split("/", 2)[2]
             agent = BY_SLUG.get(slug)
@@ -305,6 +417,13 @@ def main() -> int:
     print(f"Directory URL : {base}/agents")
     print(f"Agents        : {len(AGENTS)} across {PAGE_COUNT} pages")
     print(f"Profiles      : {base}/agents/jane-smith")
+    print()
+    print("Layout variants:")
+    print(f"  {base}/path/1      path-based pagination, no next link")
+    print(f"  {base}/table       table with first/last/title/phone/email headers")
+    print(f"  {base}/embedded    JavaScript shell + __NEXT_DATA__ only")
+    print(f"  {base}/irregular   cards with different tags/classes (link clustering)")
+    print(f"  {base}/sitemap-only no links; profiles discoverable from /sitemap.xml")
     print()
     print("Start the dashboard with local URLs allowed:")
     print('  PowerShell : $env:B2B_ALLOW_LOCAL="true"; streamlit run app.py')

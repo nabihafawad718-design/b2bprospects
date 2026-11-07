@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
+from urllib.parse import urljoin
 
 from ..inspect_site import parse_html
 from ..models import RawRecord
@@ -263,27 +264,42 @@ def _name_from(item: dict) -> str:
 
 
 def _address_from(item: dict) -> dict[str, str]:
+    # Flat fields are common in API payloads: address1/city/state/zip at the top
+    # level rather than a nested PostalAddress object.
+    flat = {
+        "street_address": _lookup(item, _STREET_KEYS),
+        "city": _lookup(item, _CITY_KEYS),
+        "state": _lookup(item, _STATE_KEYS),
+        "postal_code": _lookup(item, _POSTAL_KEYS),
+        "country": _lookup(item, _COUNTRY_KEYS),
+    }
+    state = flat["state"]
+    flat["state"] = state.upper() if len(state) == 2 else state
+
     value = item.get("address") or item.get("officeAddress") or item.get("location")
     if isinstance(value, dict) and isinstance(value.get("address"), dict):
         value = value["address"]
+    nested: dict[str, str] = {}
     if isinstance(value, str):
-        return {k: v for k, v in parse_address(value).items() if v}
-    if isinstance(value, dict):
+        nested = {k: v for k, v in parse_address(value).items() if v}
+    elif isinstance(value, dict):
         street = _scalar(value.get("streetAddress") or value.get("address1") or value.get("line1") or "")
         city = _scalar(value.get("addressLocality") or value.get("city") or "")
-        state = _scalar(value.get("addressRegion") or value.get("state") or "")
+        state_value = _scalar(value.get("addressRegion") or value.get("state") or "")
         postal = _scalar(value.get("postalCode") or value.get("zip") or "")
         country = _scalar(value.get("addressCountry") or value.get("country") or "")
-        if not any((street, city, state, postal)):
-            return {}
-        return {
+        nested = {
             "street_address": street,
             "city": city,
-            "state": state.upper() if len(state) == 2 else state,
+            "state": state_value.upper() if len(state_value) == 2 else state_value,
             "postal_code": postal,
             "country": country,
         }
-    return {}
+    result = {key: val for key, val in nested.items() if val}
+    for key, val in flat.items():
+        if val:
+            result.setdefault(key, val)
+    return result
 
 
 def embedded_blobs(html: str) -> dict[str, Any]:
@@ -350,9 +366,8 @@ def extract_from_embedded(html: str, base_url: str = "") -> tuple[list[RawRecord
 
             url = _lookup(item, _URL_KEYS)
             if url and not url.lower().startswith("javascript"):
-                if url.startswith("/"):
-                    url = base_url.rstrip("/") + url
-                fields["profile_url"] = canonical_url(url)
+                absolute = urljoin(base_url, url) if base_url else url
+                fields["profile_url"] = canonical_url(absolute)
 
             key = fields.get("profile_url") or "|".join(
                 fields.get(k, "") for k in ("agent_name", "phone", "email")

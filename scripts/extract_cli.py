@@ -72,6 +72,15 @@ def _print_result(result) -> None:
         return
     print()
     print(f"Adapter        : {result.adapter_label} ({result.adapter_id})")
+    diagnosis = getattr(result, "diagnosis", None)
+    if diagnosis is not None and diagnosis.attempts:
+        print("Methods tried  :")
+        for attempt in diagnosis.attempts:
+            print(f"  {attempt.status:6s} {attempt.label:36s} {attempt.records:4d}  {attempt.detail}")
+        if diagnosis.selected_label:
+            print(f"Delivered by   : {diagnosis.selected_label}")
+        if diagnosis.failure_code:
+            print(f"Failure        : {diagnosis.failure_code} — {diagnosis.summary}")
     print(f"Pages fetched  : {result.pages_fetched}")
     print(f"Profiles tried : {result.profiles_attempted}")
     print(f"Records        : {len(result.records)}")

@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from core.browser.structure import column_for_click
+from core.browser.structure import NON_CONTENT_TAGS, column_for_click
 from core.inspect_site import parse_html
 from core.models import StructureModel
 from core.normalize import clean_text
@@ -65,7 +65,13 @@ def sanitize_snapshot(html: str, base_url: str = "",
     limit = SETTINGS.max_snapshot_bytes if max_bytes is None else max_bytes
     soup = parse_html(html)
 
-    for tag in soup(["script", "iframe", "object", "embed", "applet", "frame", "frameset", "noscript"]):
+    # Remove the same non-content tags the structure detector removes, so the
+    # position paths in this snapshot match the ones used for extraction. Head
+    # styles are kept: they cannot shift body-level indices and are needed for
+    # the snapshot to look like the page.
+    for tag in list(soup.find_all(list(NON_CONTENT_TAGS))):
+        if tag.name == "style" and tag.find_parent("head") is not None:
+            continue
         tag.decompose()
     for meta in list(soup.find_all("meta")):
         equiv = str(meta.get("http-equiv") or "").lower()
@@ -152,12 +158,18 @@ def render_picker(html: str, base_url: str, field: str, field_label: str,
     return _clean_selection(value)
 
 
-def map_selection(structure: StructureModel | None, selection: dict[str, Any] | None) -> int | None:
+def map_selection(structure: StructureModel | None, selection: dict[str, Any] | None,
+                  html: str = "") -> int | None:
     if structure is None or not selection:
         return None
     path = str(selection.get("path") or "")
     text = clean_text(selection.get("text") or "")
-    return column_for_click(structure, path, text)
+    selector = str(selection.get("selector") or "")
+    snapshot = ""
+    if html:
+        sanitized, ok = sanitize_snapshot(html, "")
+        snapshot = sanitized if ok else ""
+    return column_for_click(structure, path, text, html=snapshot, selector=selector)
 
 
 def selection_description(selection: dict[str, Any] | None) -> str:

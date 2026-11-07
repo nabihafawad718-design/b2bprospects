@@ -35,6 +35,7 @@ STATE_HTML = "x_browser_html"
 STATE_PICKER_SEQ = "bm_picker_last_seq"
 STATE_PICKER_NONCE = "bm_picker_nonce"
 STATE_EXTRA_COLUMNS = "bm_extra_columns"
+STATE_REMOVED_EXTRAS = "bm_removed_extras"
 STATE_VISUAL_NOTE = "bm_visual_note"
 
 # Fields that can be mapped from a detected column.
@@ -60,6 +61,7 @@ def _clear_field_state() -> None:
         if str(key).startswith(("bm_field_", "bm_extra_", "bm_visual_")):
             st.session_state.pop(key, None)
     st.session_state.pop(STATE_EXTRA_COLUMNS, None)
+    st.session_state.pop(STATE_REMOVED_EXTRAS, None)
     st.session_state.pop(STATE_VISUAL_NOTE, None)
     st.session_state.pop(STATE_PICKER_SEQ, None)
 
@@ -140,6 +142,28 @@ def _render_summary(report) -> None:
             ("Pagination detail", pagination.get("reason", "—")),
             ("robots.txt", report.robots_detail or "not checked"),
         ])
+        if getattr(report, "detected_layers", None):
+            st.caption("Extraction layers available: " + " · ".join(report.detected_layers))
+        suggested = getattr(report, "suggested_mapping", {}) or {}
+        if suggested:
+            labels = [
+                FIELD_BY_KEY[key].label if key in FIELD_BY_KEY else header_for(key)
+                for key in suggested
+            ]
+            st.caption("Suggested fields: " + ", ".join(labels[:12]))
+        samples = getattr(report, "sample_records", None) or []
+        if samples:
+            with st.expander("Preview of detected records", expanded=False):
+                frame = pd.DataFrame(samples)
+                frame = frame.rename(columns={
+                    key: (FIELD_BY_KEY[key].label if key in FIELD_BY_KEY else header_for(key))
+                    for key in frame.columns
+                })
+                st.dataframe(frame, use_container_width=True, hide_index=True)
+                st.caption(
+                    "These values come from the detected structure or embedded data. Nothing has "
+                    "been extracted across pages yet."
+                )
         if report.warnings:
             notes(report.warnings)
 
@@ -227,7 +251,7 @@ def _render_visual_picker(structure, html: str, page_url: str) -> None:
             st.session_state.pop(STATE_VISUAL_NOTE, None)
             return
 
-        column_index = map_selection(structure, selection)
+        column_index = map_selection(structure, selection, html)
         if column_index is None:
             st.warning(
                 "That element did not fall inside one of the detected record columns. "
@@ -307,8 +331,21 @@ def _render_mapping(structure, html: str, page_url: str) -> FieldMapping:
                 chosen[key] = selection
                 used_columns.add(selection)
 
-        # Extra columns added visually, or manually below.
+        # Extra columns are detected automatically (job title, second phone/email,
+        # separate last-name column). They still appear here so the operator can
+        # change or remove them before extraction.
         extras: dict[str, dict] = st.session_state.get(STATE_EXTRA_COLUMNS, {})
+        removed_extras = set(st.session_state.get(STATE_REMOVED_EXTRAS, []))
+        for extra_key, column_index in suggested.columns.items():
+            if extra_key in FIELD_BY_KEY or extra_key in extras or extra_key in removed_extras:
+                continue
+            extras[extra_key] = {
+                "label": header_for(extra_key),
+                "column": column_index,
+                "auto": True,
+            }
+        if extras:
+            st.session_state[STATE_EXTRA_COLUMNS] = extras
         for extra_key, info in list(extras.items()):
             current = st.session_state.get(f"bm_field_{extra_key}", info.get("column"))
             try:
@@ -329,12 +366,22 @@ def _render_mapping(structure, html: str, page_url: str) -> FieldMapping:
                 remove = st.button("Remove", key=f"bm_extra_remove_{extra_key}", use_container_width=True)
             if remove:
                 extras.pop(extra_key, None)
+                if info.get("auto"):
+                    removed_extras.add(extra_key)
+                    st.session_state[STATE_REMOVED_EXTRAS] = sorted(removed_extras)
                 st.session_state.pop(f"bm_field_{extra_key}", None)
                 st.session_state.pop(f"bm_extra_name_{info.get('column')}", None)
                 st.rerun()
             if selection is not None:
                 chosen[extra_key] = selection
                 used_columns.add(selection)
+
+        if any(info.get("auto") for info in extras.values()):
+            st.caption(
+                "Additional columns were detected automatically (for example a job title or a "
+                "second phone number). They are exported alongside the standard fields; change "
+                "or remove any you do not need."
+            )
 
         unused = [c.index for c in structure.columns if c.index not in used_columns]
         if unused:
